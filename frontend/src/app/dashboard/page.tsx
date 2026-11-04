@@ -2,18 +2,15 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import Alert from "@mui/material/Alert";
 import Box from "@mui/material/Box";
-import Button from "@mui/material/Button";
 import CircularProgress from "@mui/material/CircularProgress";
-import Paper from "@mui/material/Paper";
-import Stack from "@mui/material/Stack";
-import Typography from "@mui/material/Typography";
 import { getSupabaseClient } from "@/lib/supabase";
+import { DocumentWorkspace } from "./document-workspace";
 
 export default function DashboardPage() {
   const router = useRouter();
   const [email, setEmail] = useState<string | null>(null);
+  const [userId, setUserId] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [errorMessage, setErrorMessage] = useState("");
 
@@ -31,6 +28,7 @@ export default function DashboardPage() {
 
         if (isActive) {
           setEmail(data.user.email ?? "");
+          setUserId(data.user.id);
         }
       } catch (error) {
         if (isActive) {
@@ -69,28 +67,20 @@ export default function DashboardPage() {
     }
   }
 
+  if (isLoading || !userId) {
+    return (
+      <Box sx={{ minHeight: "100dvh", display: "grid", placeItems: "center" }}>
+        <CircularProgress aria-label="Loading account" />
+      </Box>
+    );
+  }
+
   return (
-    <Box component="main" sx={{ maxWidth: 760, mx: "auto", px: 2, py: { xs: 5, sm: 8 } }}>
-      {isLoading ? (
-        <Box sx={{ display: "grid", minHeight: 240, placeItems: "center" }}>
-          <CircularProgress aria-label="Loading account" />
-        </Box>
-      ) : (
-        <Paper variant="outlined" sx={{ p: { xs: 3, sm: 4 }, borderRadius: 2 }}>
-          <Stack spacing={2}>
-            <Typography component="h1" variant="h4" sx={{ fontWeight: 700 }}>
-              Your Care GP account
-            </Typography>
-            {email && <Typography color="text.secondary">Signed in as {email}</Typography>}
-            {errorMessage && <Alert severity="error">{errorMessage}</Alert>}
-            <Box>
-              <Button variant="outlined" onClick={handleSignOut}>
-                Sign out
-              </Button>
-            </Box>
-          </Stack>
-        </Paper>
-      )}
-    </Box>
+    <DocumentWorkspace
+      email={email ?? ""}
+      userId={userId}
+      errorMessage={errorMessage}
+      onSignOut={handleSignOut}
+    />
   );
 }

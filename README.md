@@ -41,6 +41,8 @@ Copy-Item frontend/.env.example frontend/.env.local -Force
 
 Set `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` in `frontend/.env.local`. Never use the Supabase service-role key in a `NEXT_PUBLIC_` variable. The signup and login screens are available at `/signup` and `/login`; successful sign-in opens `/dashboard`.
 
+The import folder preference is stored per user in `public.import_preferences`. Apply `supabase/migrations/20261104000000_create_import_preferences.sql` in the Supabase SQL Editor before using folder settings. Row-level security restricts the preference row to its owner. Browsers do not expose a local folder's absolute path or allow its file-system handle to be stored in Postgres, so the database stores the folder name while the browser keeps the user-scoped access handle locally; on another device the folder must be selected again.
+
 ## Frontend deployment (Vercel)
 
 Create a Vercel project with the repository root directory set to `frontend`. Vercel detects Next.js and configures the build automatically. Add `NEXT_PUBLIC_API_URL` as a project environment variable with the deployed API base URL (for example, `https://api.example.com`), plus `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY`. Set them separately for Preview and Production environments, and add your actual deployed URL to Supabase's Redirect URLs.
