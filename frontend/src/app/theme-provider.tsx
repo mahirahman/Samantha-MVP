@@ -5,9 +5,8 @@ import { createTheme, ThemeProvider as MuiThemeProvider } from "@mui/material/st
 import type { ReactNode } from "react";
 
 const theme = createTheme({
-  colorSchemes: {
-    light: true,
-    dark: true,
+  palette: {
+    mode: "light",
   },
   cssVariables: true,
   typography: {
