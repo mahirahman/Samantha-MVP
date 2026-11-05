@@ -21,7 +21,7 @@ describe("patients", () => {
     expect(await listPatients()).toEqual([]);
   });
   it.each([
-    [[patient], [patient], 2], [[patient], [], 1], [[], [patient], 1],
+    [[patient], [patient], 2], [[patient], [], null], [[], [patient], null],
     [[patient], [{ ...patient, id: "different" }], null], [[], [], null],
   ])("scores matching identifiers and rejects conflicting patients", async (byName, byDob, count) => {
     from.mockReturnValueOnce(queryMock(byName).query).mockReturnValueOnce(queryMock(byDob).query);
@@ -63,14 +63,14 @@ describe("doctors", () => {
     expect(matchDoctorByName("Dr Jenkins", [...doctors, { id: "d3", fullName: "Dr Sam Jenkins" }])).toBeNull();
     expect(cleanDoctorName("Prof. Sarah, Jenkins")).toBe("sarah jenkins");
   });
-  it("filters inactive doctors and supplies a fallback if unavailable", async () => {
+  it("filters inactive doctors and never invents doctors when unavailable", async () => {
     const { query, response } = queryMock([{ id: "d1", full_name: "Dr Test", active: true }, { id: "d2", full_name: "Inactive", active: false }]);
     from.mockReturnValue(query);
     expect(await listDoctors()).toHaveLength(1);
     response.data = [];
-    expect((await listDoctors()).length).toBeGreaterThan(0);
+    expect(await listDoctors()).toEqual([]);
     response.error = new Error("offline");
-    expect((await listDoctors()).length).toBeGreaterThan(0);
+    await expect(listDoctors()).rejects.toThrow("offline");
   });
 });
 
@@ -102,4 +102,32 @@ describe("patient creation feedback", () => {
     from.mockReturnValue(queryMock(null, { code: "23505", message: "duplicate key" }).query);
     await expect(createPatient({ ...emptyNewPatientInput(), firstName: "Test", lastName: "Patient", dateOfBirth: "2000-01-01" })).rejects.toThrow("already exists");
   });
+});
+
+
+it("rejects ambiguous patient names, DOBs and identical name/DOB pairs", async () => {
+  const duplicates = [patient, { ...patient, id: "p2" }];
+  from.mockReturnValue(queryMock(duplicates).query);
+  expect(await matchPatientIdentifiers(patient.full_name, "")).toBeNull();
+  expect(await matchPatientIdentifiers("", patient.date_of_birth)).toBeNull();
+  expect(await matchPatientIdentifiers(patient.full_name, patient.date_of_birth)).toBeNull();
+});
+it("accepts one supplied identifier only if it resolves to one database ID", async () => {
+  from.mockReturnValue(queryMock([patient]).query);
+  expect(await matchPatientIdentifiers(patient.full_name, "")).toMatchObject({ patient: { id: "p1" }, matchedIdentifierCount: 1 });
+  expect(await matchPatientIdentifiers("", patient.date_of_birth)).toMatchObject({ patient: { id: "p1" }, matchedIdentifierCount: 1 });
+});
+it("does not treat wildcard characters in extracted patient names as matches", async () => {
+  from.mockReturnValue(queryMock([patient]).query);
+  expect(await matchPatientIdentifiers("Test%", "")).toBeNull();
+});
+it("does not verify fallback, inactive or duplicate-name doctors", () => {
+  expect(matchDoctorByName("Dr Test", [{ id: "fallback-doc-1", fullName: "Dr Test" }])).toBeNull();
+  expect(matchDoctorByName("Dr Test", [{ id: "d1", fullName: "Dr Test", active: false }])).toBeNull();
+  expect(matchDoctorByName("Dr Test", [{ id: "d1", fullName: "Dr Test" }, { id: "d2", fullName: "Dr Test" }])).toBeNull();
+});
+
+
+it("treats alternate doctor titles with the same normalized name as ambiguous", () => {
+  expect(matchDoctorByName("Dr Sarah Jenkins", [{ id: "d1", fullName: "Dr Sarah Jenkins" }, { id: "d2", fullName: "Doctor Sarah Jenkins" }])).toBeNull();
 });

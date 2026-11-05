@@ -14,13 +14,6 @@ interface DoctorRow {
   active?: boolean | null;
 }
 
-const fallbackPracticeDoctors: DoctorRecord[] = [
-  { id: "fallback-doc-1", fullName: "Dr Sarah Jenkins", email: "sarah.jenkins@caregp.com.au", active: true },
-  { id: "fallback-doc-2", fullName: "Dr Michael Chang", email: "michael.chang@caregp.com.au", active: true },
-  { id: "fallback-doc-3", fullName: "Dr Emily Taylor", email: "emily.taylor@caregp.com.au", active: true },
-  { id: "fallback-doc-4", fullName: "Dr Robert Wilson", email: "robert.wilson@caregp.com.au", active: true },
-];
-
 function toDoctorRecord(row: DoctorRow): DoctorRecord {
   return {
     id: row.id,
@@ -31,27 +24,15 @@ function toDoctorRecord(row: DoctorRow): DoctorRecord {
 }
 
 export async function listDoctors(): Promise<DoctorRecord[]> {
-  try {
-    const { data, error } = await getSupabaseClient()
-      .from("doctors")
-      .select("id, full_name, email, active")
-      .order("full_name", { ascending: true });
-
+  const rows: DoctorRow[] = [];
+  for (let offset = 0; ; offset += 1000) {
+    const { data, error } = await getSupabaseClient().from("doctors")
+      .select("id, full_name, email, active").order("full_name", { ascending: true }).order("id").range(offset, offset + 999);
     if (error) throw error;
-
-    const rows = ((data as DoctorRow[] | null) ?? [])
-      .filter((doc) => doc.active !== false)
-      .map(toDoctorRecord);
-
-    if (rows.length > 0) {
-      return rows;
-    }
-  } catch (error) {
-    // If Supabase table is unreachable or empty, use fallback practice doctors
-    console.warn("Could not query doctors table from Supabase, using practice defaults:", error);
+    rows.push(...((data ?? []) as DoctorRow[]));
+    if (!data || data.length < 1000) break;
   }
-
-  return fallbackPracticeDoctors;
+  return rows.filter((doctor) => doctor.active !== false).map(toDoctorRecord);
 }
 
 export function cleanDoctorName(name: string): string {
@@ -76,23 +57,19 @@ export function matchDoctorByName(
   rawName: string,
   doctors: DoctorRecord[],
 ): DoctorRecord | null {
+  doctors = doctors.filter((doctor) => doctor.active !== false && !doctor.id.startsWith("fallback-"));
   const trimmed = (rawName ?? "").trim();
   if (!trimmed || doctors.length === 0) return null;
 
-  const lower = trimmed.toLowerCase();
-
-  // 1. Exact case-insensitive match
-  const exact = doctors.find((d) => d.fullName.trim().toLowerCase() === lower);
-  if (exact) return exact;
-
-  // 2. Normalized match (stripping Dr/Doctor/Prof titles and punctuation)
+  // Compare normalized names across all IDs before accepting an exact label.
+  // Different title spellings must not hide an ambiguous database match.
   const cleanedRaw = cleanDoctorName(trimmed);
   if (!cleanedRaw) return null;
 
   const cleanedMatches = doctors.filter(
     (d) => cleanDoctorName(d.fullName) === cleanedRaw,
   );
-  if (cleanedMatches.length === 1) return cleanedMatches[0];
+  if (cleanedMatches.length > 0) return cleanedMatches.length === 1 ? cleanedMatches[0] : null;
 
   // 3. Token-based matching (handles "Jenkins, Sarah", initial match "Dr S Jenkins", etc.)
   const rawTokens = cleanedRaw.split(" ").filter(Boolean);

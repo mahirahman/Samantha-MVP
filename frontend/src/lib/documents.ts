@@ -1,10 +1,17 @@
 import { getSupabaseClient } from "./supabase";
+import { validateDocumentFiling } from "./document-filing";
 import type { DocumentHighlight } from "./document-processing";
 import type { NewPatientInput } from "./patients";
 
 export type DocumentStatus = "check" | "verified" | "error" | "imported" | "deleted";
 export type InboxType = "Doctor's Inbox" | "Patient's File";
 export type StoreLocation = "Correspondence" | "Investigations";
+
+export interface ExtractedPatient {
+  name: string;
+  dateOfBirth: string;
+  demographics?: NewPatientInput;
+}
 
 export interface DocumentItem {
   id: string;
@@ -15,6 +22,7 @@ export interface DocumentItem {
   inbox: InboxType;
   patient: string;
   patientId?: string;
+  extractedPatient?: ExtractedPatient;
   dateOfBirth: string;
   patientVerified: boolean;
   matchedIdentifierCount: number;
@@ -56,6 +64,7 @@ interface DocumentRow {
   patient_name?: string | null;
   patient_dob?: string | null;
   patient_id?: string | null;
+  extracted_patient?: ExtractedPatient | null;
   patient_verified?: boolean | null;
   matched_identifier_count?: number | null;
   assigned_user?: string | null;
@@ -125,8 +134,9 @@ function mapRowToDocumentItem(row: DocumentRow): DocumentItem {
     inbox: (row.inbox as InboxType) || "Doctor's Inbox",
     patient: row.patient_name || "",
     patientId: row.patient_id || undefined,
+    extractedPatient: row.extracted_patient || undefined,
     dateOfBirth: row.patient_dob || "",
-    patientVerified: Boolean(row.patient_verified),
+    patientVerified: Boolean(row.patient_verified && row.patient_id),
     matchedIdentifierCount: row.matched_identifier_count || (row.patient_verified ? 2 : 0),
     demographics: row.demographics || undefined,
     fileSize: Number(row.file_size) || 0,
@@ -137,7 +147,7 @@ function mapRowToDocumentItem(row: DocumentRow): DocumentItem {
     storeIn: (row.store_in as StoreLocation) || "Correspondence",
     assignedUser: row.assigned_user || "",
     doctorId: row.doctor_id || undefined,
-    userVerified: Boolean(row.user_verified),
+    userVerified: Boolean(row.user_verified && row.doctor_id && !row.doctor_id.startsWith("fallback-")),
     category: row.category || row.document_category || "",
     ocrCharacterCount: row.ocr_character_count || undefined,
     processingError: row.processing_error || undefined,
@@ -226,6 +236,10 @@ export async function saveWorkspaceDocument(
   userId?: string,
   file?: File,
 ): Promise<void> {
+  if (doc.status === "imported") {
+    await fileWorkspaceDocument(doc, userId);
+    return;
+  }
   // Update local cache first
   const current = loadCachedDocuments(userId);
   const exists = current.some((d) => d.id === doc.id);
@@ -258,6 +272,7 @@ export async function saveWorkspaceDocument(
       patient_name: doc.patient,
       patient_dob: doc.dateOfBirth || null,
       patient_id: doc.patientId || null,
+      extracted_patient: doc.extractedPatient || null,
       patient_verified: doc.patientVerified,
       matched_identifier_count: doc.matchedIdentifierCount,
       assigned_user: doc.assignedUser,
@@ -284,12 +299,8 @@ export async function saveWorkspaceDocument(
     }
 
     // Sync to document_extractions table if patient or doctor exists
-    void syncDocumentExtraction(doc, client);
+    await syncDocumentExtraction(doc, client);
 
-    // Sync to filings table if status is imported
-    if (doc.status === "imported") {
-      void syncFiling(doc, userId, client);
-    }
   } catch (err) {
     throw err;
   }
@@ -304,14 +315,6 @@ export async function saveWorkspaceDocuments(
   files?: File[],
 ): Promise<void> {
   const fileMap = new Map(files?.map((f) => [f.name.toLowerCase().trim(), f]));
-
-  // Update local cache
-  const current = loadCachedDocuments(userId);
-  const currentMap = new Map(current.map((d) => [d.id, d]));
-  for (const doc of docs) {
-    currentMap.set(doc.id, doc);
-  }
-  setCachedDocuments(Array.from(currentMap.values()), userId);
 
   // Upsert to Supabase
   for (const doc of docs) {
@@ -336,8 +339,13 @@ export async function updateWorkspaceDocumentInDb(
     }
     return d;
   });
-  setCachedDocuments(nextCache, userId);
   const updatedDoc = nextCache.find((doc) => doc.id === docId);
+  if (updatedDoc?.status === "imported") {
+    await fileWorkspaceDocument(updatedDoc, userId);
+    return;
+  }
+  if (updates.status === "imported") throw new Error("Reload the document before importing.");
+  setCachedDocuments(nextCache, userId);
 
   try {
     const client = getSupabaseClient();
@@ -349,6 +357,7 @@ export async function updateWorkspaceDocumentInDb(
     if (updates.patient !== undefined) rowUpdates.patient_name = updates.patient;
     if (updates.dateOfBirth !== undefined) rowUpdates.patient_dob = updates.dateOfBirth;
     if (updates.patientId !== undefined) rowUpdates.patient_id = updates.patientId || null;
+    if (updates.extractedPatient !== undefined) rowUpdates.extracted_patient = updates.extractedPatient;
     if (updates.patientVerified !== undefined) rowUpdates.patient_verified = updates.patientVerified;
     if (updates.matchedIdentifierCount !== undefined) rowUpdates.matched_identifier_count = updates.matchedIdentifierCount;
     if (updates.assignedUser !== undefined) rowUpdates.assigned_user = updates.assignedUser;
@@ -372,10 +381,7 @@ export async function updateWorkspaceDocumentInDb(
     }
 
     if (updatedDoc) {
-      void syncDocumentExtraction(updatedDoc, client);
-      if (updatedDoc.status === "imported") {
-        void syncFiling(updatedDoc, userId, client);
-      }
+      await syncDocumentExtraction(updatedDoc, client);
     }
   } catch (err) {
     console.warn("updateWorkspaceDocumentInDb error:", err);
@@ -443,36 +449,36 @@ async function syncDocumentExtraction(doc: DocumentItem, client: ReturnType<type
   }
 }
 
-/**
- * Helper to sync filed document in public.filings.
- */
-async function syncFiling(
-  doc: DocumentItem,
-  userId: string | undefined,
-  client: ReturnType<typeof getSupabaseClient>,
-) {
-  if (!doc.patientId) return;
-
-  try {
-    await client.from("filings").upsert(
-      {
-        document_id: doc.id,
-        patient_id: doc.patientId,
-        doctor_id: doc.doctorId || null,
-        date_of_report: doc.reportDate || new Date().toISOString().slice(0, 10),
-        subject: doc.subject || "Medical Document",
-        source_contact: doc.contact || null,
-        inbox_type: doc.inbox,
-        store_in: doc.storeIn,
-        category: doc.category || "Correspondence",
-        approved_by: userId || null,
-        approved_at: new Date().toISOString(),
-        status: "filed",
-      },
-      { onConflict: "document_id" },
-    );
-  } catch {
-    // Graceful ignore
+/** Atomically saves the reviewed metadata, extraction, filing and Imported status. */
+export async function fileWorkspaceDocument(doc: DocumentItem, userId?: string): Promise<DocumentItem> {
+  const errors = validateDocumentFiling(doc);
+  if (Object.keys(errors).length) throw new Error(Object.values(errors).join(" "));
+  const imported: DocumentItem = {
+    ...doc, status: "imported", patient: doc.patient.trim(), reportDate: doc.reportDate.trim(),
+    subject: doc.subject.trim(), contact: doc.contact.trim(), processingError: undefined,
+    assignedUser: doc.inbox === "Patient's File" ? "" : doc.assignedUser.trim(),
+    doctorId: doc.inbox === "Patient's File" ? undefined : doc.doctorId,
+    userVerified: doc.inbox === "Patient's File" ? false : doc.userVerified,
+  };
+  const { error } = await getSupabaseClient().rpc("file_workspace_document", {
+    p_document_id: doc.id,
+    p_fields: {
+      patient_name: imported.patient, patient_id: imported.patientId,
+      patient_dob: imported.dateOfBirth || null, patient_verified: imported.patientVerified,
+      extracted_patient: imported.extractedPatient || null,
+      matched_identifier_count: imported.matchedIdentifierCount,
+      report_date: imported.reportDate, subject: imported.subject, source_contact: imported.contact,
+      inbox: imported.inbox, store_in: imported.storeIn, document_category: imported.category,
+      assigned_user: imported.assignedUser, doctor_id: imported.doctorId || null,
+      user_verified: imported.userVerified, demographics: imported.demographics || {},
+      highlights: imported.highlights || [], ocr_character_count: imported.ocrCharacterCount || 0,
+    },
+  });
+  if (error) {
+    const reason = error.code === "PGRST202" ? "Apply the atomic document filing migration before importing." : error.message;
+    throw new Error(`Could not import document: ${reason}`);
   }
+  const current = loadCachedDocuments(userId);
+  setCachedDocuments([imported, ...current.filter((item) => item.id !== imported.id)], userId);
+  return imported;
 }
-

@@ -15,13 +15,10 @@ import Dialog from "@mui/material/Dialog";
 import DialogActions from "@mui/material/DialogActions";
 import DialogContent from "@mui/material/DialogContent";
 import DialogTitle from "@mui/material/DialogTitle";
-import FormControlLabel from "@mui/material/FormControlLabel";
 import IconButton from "@mui/material/IconButton";
 import LinearProgress from "@mui/material/LinearProgress";
 import MenuItem from "@mui/material/MenuItem";
 import Paper from "@mui/material/Paper";
-import Radio from "@mui/material/Radio";
-import RadioGroup from "@mui/material/RadioGroup";
 import Snackbar from "@mui/material/Snackbar";
 import Stack from "@mui/material/Stack";
 import Tab from "@mui/material/Tab";
@@ -68,7 +65,9 @@ import {
   saveImportFolderName,
   type ImportDirectoryHandle,
 } from "@/lib/import-folder";
-import { listWorkspaceDocuments, saveWorkspaceDocument, deleteWorkspaceDocumentsFromDb, restoreWorkspaceDocumentFromDb, type DocumentItem as StoredDocumentItem } from "@/lib/documents";
+import { listWorkspaceDocuments, fileWorkspaceDocument, saveWorkspaceDocument, deleteWorkspaceDocumentsFromDb, restoreWorkspaceDocumentFromDb, type DocumentItem as StoredDocumentItem } from "@/lib/documents";
+import { documentCategories, getCategoryRouting, validateDocumentFiling } from "@/lib/document-filing";
+import { originalExtractedPatient, patientOptions, patientOptionKey, patientOptionLabel, type PatientOption } from "@/lib/patient-selection";
 import { processDocumentFile } from "@/lib/document-processing";
 import { InteractiveDocumentViewer } from "./interactive-document-viewer";
 import {
@@ -91,48 +90,8 @@ import {
 
 type DocumentStatus = StoredDocumentItem["status"];
 type QueueTab = "queue" | "imported" | "errors" | "recycle";
-type ImportDestination = "assigned" | "doctor-inbox" | "patient-file";
 type StoreLocation = "Correspondence" | "Investigations";
-
-const documentCategories = [
-  "Admissions summary",
-  "Advance care planning",
-  "Allied health letter",
-  "Certificate",
-  "Clinical notes",
-  "Clinical photograph",
-  "Consent form",
-  "DAS21",
-  "Discharge summary",
-  "ECG",
-  "Email",
-  "Form",
-  "Immunisation",
-  "Indigenous PIP",
-  "Letter",
-  "Medical imaging report",
-  "MyHealth registration",
-  "New PT registration form",
-  "Pathology results",
-  "Patient consent",
-  "Record request",
-  "Referral letter",
-  "Workcover",
-  "Workcover consent",
-] as const;
-
-const doctorReviewCategories = new Set<string>([
-  "Admissions summary",
-  "Advance care planning",
-  "Allied health letter",
-  "Clinical notes",
-  "Discharge summary",
-  "ECG",
-  "Letter",
-  "Medical imaging report",
-  "Pathology results",
-  "Referral letter",
-]);
+type BatchStoreLocation = "category" | StoreLocation;
 
 type DocumentItem = StoredDocumentItem & {
   demographics: NewPatientInput;
@@ -167,14 +126,16 @@ export function isDocumentVerified(document: {
   inbox: string;
   patientVerified: boolean;
   userVerified: boolean;
+  patientId?: string;
+  doctorId?: string;
 }): boolean {
-  if (!document.patientVerified) {
+  if (!document.patientVerified || !document.patientId) {
     return false;
   }
   if (document.inbox === "Patient's File") {
     return true;
   }
-  return document.userVerified;
+  return Boolean(document.userVerified && document.doctorId && !document.doctorId.startsWith("fallback-"));
 }
 
 export function getDocumentStatus(document: DocumentItem): DocumentStatus {
@@ -227,11 +188,15 @@ export function DocumentWorkspace({
   const [reportErrorDialogOpen, setReportErrorDialogOpen] = useState(false);
   const [reportErrorMessage, setReportErrorMessage] = useState("");
   const [isReprocessing, setIsReprocessing] = useState(false);
-  const [importDestination, setImportDestination] = useState<ImportDestination>("assigned");
+  const [batchStoreIn, setBatchStoreIn] = useState<BatchStoreLocation>("category");
+  const verificationRequests = useRef(new Map<string, number>());
   const [bulkImportCount, setBulkImportCount] = useState<number | null>(null);
   const [isCountingFolder, setIsCountingFolder] = useState(false);
   const [pdfOperation, setPdfOperation] = useState<PdfOperation | null>(null);
   const [isRecycling, setIsRecycling] = useState(false);
+  const [isFiling, setIsFiling] = useState(false);
+  const filingInProgress = useRef(false);
+  const [filingError, setFilingError] = useState<{ documentId: string; message: string } | null>(null);
   const uploadInput = useRef<HTMLInputElement>(null);
   const folderInput = useRef<HTMLInputElement>(null);
   const previewUrls = useRef(new Set<string>());
@@ -375,6 +340,13 @@ export function DocumentWorkspace({
   const selectedDocument = documents.find(
     (document) => document.id === selectedDocumentId,
   );
+  const patientDropdownOptions = selectedDocument ? patientOptions(selectedDocument, patientRecords) : [];
+  const selectedPatientOption = selectedDocument ? patientDropdownOptions.find((option) =>
+    selectedDocument.patientId ? option.kind === "database" && option.patient.id === selectedDocument.patientId
+      : option.kind === "extracted" && option.extracted.name === selectedDocument.patient) ?? null : null;
+  const isSelectedImported = selectedDocument?.status === "imported";
+  const filingErrors = selectedDocument ? validateDocumentFiling(selectedDocument) : {};
+  const canFileSelected = selectedDocument && selectedDocument.status !== "imported" && Object.keys(filingErrors).length === 0;
   const selectedDocumentPosition = visibleDocuments.findIndex(
     (document) => document.id === selectedDocumentId,
   );
@@ -387,18 +359,6 @@ export function DocumentWorkspace({
           "User not found in database",
       ].filter((issue): issue is string => Boolean(issue))
     : [];
-  const availablePatients = Array.from(
-    new Set([
-      ...patientRecords.map((patient) => patient.fullName),
-      ...documents.map((document) => document.patient).filter(Boolean),
-    ]),
-  );
-  const availableDoctors = Array.from(
-    new Set([
-      ...doctorRecords.map((doctor) => doctor.fullName),
-      ...documents.map((document) => document.assignedUser).filter(Boolean),
-    ]),
-  );
   const needsFolderAccess = Boolean(
     folderName && !folderHandle && folderFiles.length === 0,
   );
@@ -450,23 +410,50 @@ export function DocumentWorkspace({
   }
 
   function updateDocument(documentId: string, updates: Partial<DocumentItem>) {
+    setFilingError(null);
     setDocuments((current) =>
       current.map((document) =>
-        document.id === documentId ? { ...document, ...updates } : document,
+        document.id === documentId && document.status !== "imported" ? { ...document, ...updates } : document,
       ),
     );
   }
 
   function handleCategoryChange(document: DocumentItem, category: string) {
-    const needsDoctorReview = doctorReviewCategories.has(category);
-    updateDocument(document.id, {
-      category,
-      storeIn: needsDoctorReview ? "Investigations" : "Correspondence",
-    });
+    const routing = getCategoryRouting(category);
+    const next = { ...document, category, inbox: routing?.inbox ?? "Doctor's Inbox", storeIn: routing?.storeIn ?? "Correspondence" } as DocumentItem;
+    if (next.inbox === "Patient's File") {
+      next.doctorId = undefined;
+      next.assignedUser = "";
+      next.userVerified = false;
+    }
+    next.status = getDocumentStatus(next);
+    updateDocument(document.id, next);
+  }
+
+  function handlePatientSelection(document: DocumentItem, option: PatientOption | null) {
+    verificationRequests.current.set(document.id, (verificationRequests.current.get(document.id) ?? 0) + 1);
+    const original = originalExtractedPatient(document);
+    const patient = option?.kind === "database" ? option.patient : null;
+    const extracted = option?.kind === "extracted" ? option.extracted : undefined;
+    const next = { ...document, extractedPatient: original,
+      patient: patient?.fullName ?? extracted?.name ?? "", patientId: patient?.id,
+      dateOfBirth: patient?.dateOfBirth ?? extracted?.dateOfBirth ?? "",
+      demographics: extracted?.demographics ?? document.demographics,
+      patientVerified: Boolean(patient), matchedIdentifierCount: patient ? 2 : 0 };
+    updateDocument(document.id, { ...next, status: getDocumentStatus(next) });
+  }
+
+  function applyBatchStorage() {
+    if (isImporting || isRecycling || isFiling) return;
+    setDocuments((current) => current.map((doc) => {
+      if (!selectedIds.has(doc.id) || !["check", "verified"].includes(doc.status)) return doc;
+      return { ...doc, storeIn: batchStoreIn === "category" ? getCategoryRouting(doc.category)?.storeIn ?? doc.storeIn : batchStoreIn };
+    }));
+    showNotice("Storage location updated for the selected Queue documents");
   }
 
   function handleOpenCreatePatientDialog() {
-    if (!selectedDocument) return;
+    if (!selectedDocument || selectedDocument.status === "imported") return;
     setShowPatientValidation(false);
     setPatientCreationError("");
 
@@ -511,7 +498,7 @@ export function DocumentWorkspace({
   }
 
   async function handleCreatePatient() {
-    if (isCreatingPatient || !selectedDocument) return;
+    if (isCreatingPatient || !selectedDocument || selectedDocument.status === "imported") return;
     setShowPatientValidation(true);
     setPatientCreationError("");
     if (Object.keys(validateNewPatientInput(newPatientForm)).length) return;
@@ -523,7 +510,7 @@ export function DocumentWorkspace({
         (a, b) => a.fullName.localeCompare(b.fullName),
       ));
       const isVerified = isDocumentVerified({
-        inbox: selectedDocument.inbox,
+        inbox: selectedDocument.inbox, patientId: patient.id, doctorId: selectedDocument.doctorId,
         patientVerified: true,
         userVerified: selectedDocument.userVerified,
       });
@@ -547,7 +534,7 @@ export function DocumentWorkspace({
   async function handleUpload(event: ChangeEvent<HTMLInputElement>) {
     const allFiles = Array.from(event.target.files ?? []);
     event.target.value = "";
-    if (allFiles.length === 0 || !documentsLoaded || isImporting) return;
+    if (allFiles.length === 0 || !documentsLoaded || isImporting || filingInProgress.current) return;
 
     // Reject any files that already exist in documents (queue, imported, or errors) or duplicates in current batch
     const existingNames = new Set(documents.filter((d) => d.status !== "deleted").map((d) => d.name.toLowerCase().trim()));
@@ -769,7 +756,7 @@ export function DocumentWorkspace({
   }
 
   async function handleDeleteSelected() {
-    if (selectedCount === 0 || isImporting || isRecycling) return;
+    if (selectedCount === 0 || isImporting || isRecycling || isFiling) return;
     setIsRecycling(true);
     try {
       await persistenceQueue.current;
@@ -785,7 +772,7 @@ export function DocumentWorkspace({
   }
 
   async function handleRestoreSelected() {
-    if (selectedCount === 0 || isImporting || isRecycling) return;
+    if (selectedCount === 0 || isImporting || isRecycling || isFiling) return;
     setIsRecycling(true);
     try {
       await persistenceQueue.current;
@@ -803,6 +790,30 @@ export function DocumentWorkspace({
       try { await reloadSavedDocuments(); } catch { /* Keep current documents if the database is unavailable. */ }
       showNotice(error instanceof Error ? error.message : "Could not restore documents");
     } finally { setIsRecycling(false); }
+  }
+
+  async function handleImportDocument() {
+    if (!selectedDocument || !canFileSelected || isReprocessing || filingInProgress.current) return;
+    const snapshot = selectedDocument;
+    filingInProgress.current = true;
+    setIsFiling(true);
+    setFilingError(null);
+    const task = persistenceQueue.current.then(() => fileWorkspaceDocument(snapshot, userId));
+    // Serialize later workspace saves after this import, without hiding its failure from this handler.
+    persistenceQueue.current = task.then(() => undefined, () => undefined);
+    try {
+      const saved = await task;
+      const imported: DocumentItem = { ...saved, demographics: saved.demographics ?? emptyNewPatientInput(), fileLastModified: saved.fileLastModified ?? 0 };
+      persistedDocuments.current.set(imported.id, imported);
+      setDocuments((current) => current.map((doc) => doc.id === imported.id ? imported : doc));
+      showNotice(`"${imported.name}" moved to Imported tab`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Could not import document. Please try again.";
+      setFilingError({ documentId: snapshot.id, message });
+    } finally {
+      filingInProgress.current = false;
+      setIsFiling(false);
+    }
   }
 
   function openPdfOperation(mode: "split" | "merge") {
@@ -909,7 +920,7 @@ export function DocumentWorkspace({
   }
 
   async function handleConfirmBulkImport() {
-    if (isImporting || !documentsLoaded) return;
+    if (isImporting || !documentsLoaded || filingInProgress.current) return;
     if (folderName && !folderHandle && folderFiles.length === 0) {
       setImportDialogOpen(false);
       void handleChooseFolder();
@@ -978,7 +989,7 @@ export function DocumentWorkspace({
 
         try {
           const processed = await processDocumentFile(file);
-          folderDocuments.push(await mapExtraction(document, processed));
+          folderDocuments.push(await mapExtraction(document, processed, batchStoreIn === "category" ? undefined : batchStoreIn));
         } catch (error) {
           folderDocuments.push({
             ...document,
@@ -1043,13 +1054,12 @@ export function DocumentWorkspace({
   async function mapExtraction(
     document: DocumentItem,
     result: Awaited<ReturnType<typeof processDocumentFile>>,
+    storeOverride?: StoreLocation,
   ): Promise<DocumentItem> {
     const extraction = result.extraction;
-    const inbox = importDestination === "doctor-inbox"
-      ? "Doctor's Inbox"
-      : importDestination === "patient-file"
-        ? "Patient's File"
-        : extraction.inboxType || "Doctor's Inbox";
+    const routing = getCategoryRouting(extraction.category);
+    const inbox = routing?.inbox ?? "Doctor's Inbox";
+    let matchedPatient: PatientRecord | undefined;
 
     let patientVerified = false;
     let patientId: string | undefined;
@@ -1058,6 +1068,7 @@ export function DocumentWorkspace({
       const match = await matchPatientIdentifiers(extraction.patientName, extraction.patientDateOfBirth);
       patientVerified = Boolean(match);
       patientId = match?.patient.id;
+      matchedPatient = match?.patient;
       matchedIdentifierCount = match?.matchedIdentifierCount ?? 0;
     } catch {
       patientVerified = false;
@@ -1115,7 +1126,7 @@ export function DocumentWorkspace({
     }
 
     const isVerified = isDocumentVerified({
-      inbox,
+      inbox, patientId, doctorId,
       patientVerified,
       userVerified,
     });
@@ -1123,9 +1134,13 @@ export function DocumentWorkspace({
     return {
       ...document,
       status: isVerified ? "verified" : "check",
-      patient: extraction.patientName,
+      patient: matchedPatient?.fullName ?? extraction.patientName,
+      extractedPatient: document.extractedPatient ?? {
+        name: extraction.patientName || [extraction.patientFirstName, extraction.patientMiddleName, extraction.patientLastName].filter(Boolean).join(" "),
+        dateOfBirth: extraction.patientDateOfBirth || "", demographics,
+      },
       patientId,
-      dateOfBirth: extraction.patientDateOfBirth,
+      dateOfBirth: matchedPatient?.dateOfBirth ?? extraction.patientDateOfBirth,
       patientVerified,
       matchedIdentifierCount,
       demographics,
@@ -1133,7 +1148,7 @@ export function DocumentWorkspace({
       subject: extraction.subject,
       contact: extraction.sourceContact,
       inbox,
-      storeIn: extraction.storeIn || document.storeIn,
+      storeIn: storeOverride ?? routing?.storeIn ?? "Correspondence",
       assignedUser,
       doctorId,
       userVerified,
@@ -1150,62 +1165,27 @@ export function DocumentWorkspace({
    * "check" and "verified" accordingly. Used both after automatic extraction
    * and after manual edits to the patient or date of birth fields.
    */
-  async function verifyPatientMatch(
-    documentId: string,
-    fullName: string,
-    dateOfBirth: string,
-  ) {
+  async function verifyPatientMatch(documentId: string, fullName: string, dateOfBirth: string) {
+    const version = (verificationRequests.current.get(documentId) ?? 0) + 1;
+    verificationRequests.current.set(documentId, version);
     try {
       const match = await matchPatientIdentifiers(fullName, dateOfBirth);
-      const patientVerified = Boolean(match);
-      setDocuments((current) =>
-        current.map((item) => {
-          if (item.id !== documentId) return item;
-          const isVerified = isDocumentVerified({
-            inbox: item.inbox,
-            patientVerified,
-            userVerified: item.userVerified,
-          });
-          return {
-            ...item,
-            patientVerified,
-            patientId: match?.patient.id ?? item.patientId,
-            matchedIdentifierCount: match?.matchedIdentifierCount ?? (patientVerified ? 2 : 0),
-            status: item.status === "imported" ? "imported" : item.status === "error" ? "error" : isVerified ? "verified" : "check",
-          };
-        }),
-      );
+      if (verificationRequests.current.get(documentId) !== version) return;
+      setDocuments((current) => current.map((item) => {
+        if (item.id !== documentId || item.status === "imported" || item.patient !== fullName || item.dateOfBirth !== dateOfBirth) return item;
+        const next = { ...item, patient: match?.patient.fullName ?? fullName,
+          patientVerified: Boolean(match), patientId: match?.patient.id,
+          matchedIdentifierCount: match?.matchedIdentifierCount ?? 0 };
+        return { ...next, status: getDocumentStatus(next) };
+      }));
     } catch {
-      showNotice("Could not verify the patient against the database");
+      if (verificationRequests.current.get(documentId) === version) showNotice("Could not verify the patient against the database. Select the patient again to retry.");
     }
   }
 
-  function handleDoctorChange(documentId: string, doctorName: string) {
-    const trimmed = (doctorName ?? "").trim();
-    const currentDoctors =
-      doctorRecordsRef.current.length > 0 ? doctorRecordsRef.current : doctorRecords;
-    const matchedDoctor = matchDoctorByName(trimmed, currentDoctors);
-    const userVerified = Boolean(matchedDoctor);
-    const doctorId = matchedDoctor?.id;
-    const assignedUser = matchedDoctor ? matchedDoctor.fullName : trimmed;
-
-    setDocuments((current) =>
-      current.map((item) => {
-        if (item.id !== documentId) return item;
-        const isVerified = isDocumentVerified({
-          inbox: item.inbox,
-          patientVerified: item.patientVerified,
-          userVerified,
-        });
-        return {
-          ...item,
-          assignedUser,
-          doctorId,
-          userVerified,
-          status: item.status === "imported" ? "imported" : item.status === "error" ? "error" : isVerified ? "verified" : "check",
-        };
-      }),
-    );
+  function handleDoctorSelection(document: DocumentItem, doctor: DoctorRecord | null) {
+    const next = { ...document, assignedUser: doctor?.fullName ?? "", doctorId: doctor?.id, userVerified: Boolean(doctor && doctor.active !== false && !doctor.id.startsWith("fallback-")) };
+    updateDocument(document.id, { ...next, status: getDocumentStatus(next) });
   }
 
   function refreshQueue(scope: "all" | "selected") {
@@ -1213,13 +1193,13 @@ export function DocumentWorkspace({
   }
 
   function handleOpenReportErrorDialog() {
-    if (!selectedDocument) return;
+    if (!selectedDocument || selectedDocument.status === "imported") return;
     setReportErrorMessage(selectedDocument.processingError || "");
     setReportErrorDialogOpen(true);
   }
 
   function handleConfirmReportError() {
-    if (!selectedDocument) return;
+    if (!selectedDocument || selectedDocument.status === "imported") return;
     const msg = reportErrorMessage.trim() || "Flagged as error by user";
     updateDocument(selectedDocument.id, {
       status: "error",
@@ -1232,7 +1212,7 @@ export function DocumentWorkspace({
   }
 
   function handleResetDocumentToDefault() {
-    if (!selectedDocument) return;
+    if (!selectedDocument || selectedDocument.status === "imported") return;
 
     const defaultReportDate = selectedDocument.fileLastModified
       ? new Date(selectedDocument.fileLastModified).toISOString().slice(0, 10)
@@ -1267,7 +1247,7 @@ export function DocumentWorkspace({
   }
 
   async function handleReprocessDocument() {
-    if (!selectedDocument || isReprocessing) return;
+    if (!selectedDocument || selectedDocument.status === "imported" || isReprocessing) return;
     if (!selectedDocument.previewUrl) {
       showNotice("The document preview file is unavailable for reprocessing");
       return;
@@ -1289,7 +1269,7 @@ export function DocumentWorkspace({
       const updated = await mapExtraction(selectedDocument, processed);
 
       setDocuments((current) =>
-        current.map((item) => (item.id === selectedDocument.id ? updated : item)),
+        current.map((item) => (item.id === selectedDocument.id && item.status !== "imported" ? updated : item)),
       );
       setActiveHighlightField(null);
       if (activeTab !== "queue") {
@@ -1413,7 +1393,7 @@ export function DocumentWorkspace({
             <Button
               variant="contained"
               startIcon={<CloudUploadOutlinedIcon />}
-              disabled={!documentsLoaded || isImporting}
+              disabled={!documentsLoaded || isImporting || isFiling}
               onClick={() => uploadInput.current?.click()}
               sx={{ whiteSpace: "nowrap" }}
             >
@@ -1432,7 +1412,7 @@ export function DocumentWorkspace({
               color="info"
               startIcon={<AutoAwesomeIcon />}
               onClick={handleOpenBulkImport}
-              disabled={!documentsLoaded || (!folderName && !folderHandle && folderFiles.length === 0) || isImporting}
+              disabled={!documentsLoaded || (!folderName && !folderHandle && folderFiles.length === 0) || isImporting || isFiling}
               sx={{ whiteSpace: "nowrap", flex: 1 }}
             >
               {isImporting ? <CircularProgress size={20} color="inherit" /> : "Auto Bulk Import"}
@@ -1515,7 +1495,7 @@ export function DocumentWorkspace({
                 label={activeTab === "recycle" ? "Restore selected" : "Move to recycle bin"}
                 icon={activeTab === "recycle" ? <RestoreFromTrashIcon fontSize="small" /> : <DeleteIcon fontSize="small" />}
                 onClick={activeTab === "recycle" ? handleRestoreSelected : handleDeleteSelected}
-                disabled={selectedCount === 0 || isImporting || isRecycling}
+                disabled={selectedCount === 0 || isImporting || isRecycling || isFiling}
               />
               <QueueActionButton
                 label="Select all"
@@ -1530,10 +1510,16 @@ export function DocumentWorkspace({
                 disabled={selectedCount === 0}
               />
               {activeTab === "queue" && <>
-                <QueueActionButton label="Split PDF" icon={<ContentCutIcon fontSize="small" />} onClick={() => openPdfOperation("split")} disabled={isImporting || isRecycling || !(selectedCount === 1 || (selectedCount === 0 && selectedDocument))} />
-                <QueueActionButton label="Merge PDFs" icon={<MergeIcon fontSize="small" />} onClick={() => openPdfOperation("merge")} disabled={isImporting || isRecycling || selectedCount < 2} />
+                <QueueActionButton label="Split PDF" icon={<ContentCutIcon fontSize="small" />} onClick={() => openPdfOperation("split")} disabled={isImporting || isRecycling || isFiling || !(selectedCount === 1 || (selectedCount === 0 && selectedDocument))} />
+                <QueueActionButton label="Merge PDFs" icon={<MergeIcon fontSize="small" />} onClick={() => openPdfOperation("merge")} disabled={isImporting || isRecycling || isFiling || selectedCount < 2} />
               </>}
             </Stack>
+            {activeTab === "queue" && <Stack direction="row" spacing={1} sx={{ mt: 1.5 }}>
+              <TextField select size="small" label="Batch Store in" value={batchStoreIn} onChange={(event) => setBatchStoreIn(event.target.value as BatchStoreLocation)} sx={{ minWidth: 160 }}>
+                <MenuItem value="category">Category default</MenuItem><MenuItem value="Correspondence">Correspondence</MenuItem><MenuItem value="Investigations">Investigations</MenuItem>
+              </TextField>
+              <Button onClick={applyBatchStorage} disabled={selectedCount === 0 || isImporting || isRecycling || isFiling}>Apply to selected</Button>
+            </Stack>}
             {activeTab === "recycle" && <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>Documents are retained in this app. Restore returns them to their previous tabs. Files on your computer remain unchanged.</Typography>}
             {pdfOperation && <PdfOperationsDialog operation={pdfOperation} onClose={() => setPdfOperation(null)} onSave={savePdfOperation} />}
 
@@ -1617,42 +1603,17 @@ export function DocumentWorkspace({
                         : `${bulkImportCount} new document${bulkImportCount === 1 ? "" : "s"} selected`}
                   </Typography>
                   <Typography variant="body2" color="text.secondary">
-                    Destination: {importDestination === "assigned"
-                      ? "Each Document's Setting"
-                      : importDestination === "doctor-inbox"
-                        ? "Doctor's Inbox"
-                        : "Patient's File"}
+                    Inbox Type is determined by the document category.
                   </Typography>
                 </Stack>
               </DialogTitle>
               <DialogContent>
-                <RadioGroup
-                  value={importDestination}
-                  onChange={(_, value) => setImportDestination(value as ImportDestination)}
-                  aria-label="Import destination"
-                >
-                  <FormControlLabel
-                    value="assigned"
-                    control={<Radio />}
-                    label="Each document's assigned Inbox Type"
-                  />
-                  <FormControlLabel
-                    value="doctor-inbox"
-                    control={<Radio />}
-                    label="Doctor's Inbox"
-                  />
-                  <FormControlLabel
-                    value="patient-file"
-                    control={<Radio />}
-                    label="Patient's File"
-                  />
-                </RadioGroup>
-                <Alert severity="info" sx={{ mt: 1 }}>
-                  <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
-                    Before You Continue
-                  </Typography>
-                  Confirm the destination before allocating these documents.
-                </Alert>
+                <TextField select fullWidth label="Store in for this batch" value={batchStoreIn} onChange={(event) => setBatchStoreIn(event.target.value as BatchStoreLocation)} sx={{ mt: 1 }}>
+                  <MenuItem value="category">Category default</MenuItem>
+                  <MenuItem value="Correspondence">Correspondence</MenuItem>
+                  <MenuItem value="Investigations">Investigations</MenuItem>
+                </TextField>
+                <Alert severity="info" sx={{ mt: 1 }}>The storage selection applies to new files in this batch. Inbox Type always follows category. Changing category later resets Store in to its category default.</Alert>
                 {bulkImportCount === null && (
                   <Alert severity="warning" sx={{ mt: 1 }}>
                     {needsFolderAccess
@@ -1684,7 +1645,7 @@ export function DocumentWorkspace({
                   variant="contained"
                   startIcon={<MoveToInboxIcon />}
                   onClick={handleConfirmBulkImport}
-                  disabled={isImporting || bulkImportCount === null || bulkImportCount === 0}
+                  disabled={isImporting || isFiling || bulkImportCount === null || bulkImportCount === 0}
                 >
                   {isImporting ? "Allocating..." : "Confirm & Allocate"}
                 </Button>
@@ -1874,6 +1835,8 @@ export function DocumentWorkspace({
         >
           {selectedDocument && selectedDocument.status !== "deleted" ? (
             <Paper
+              component="fieldset"
+              disabled={isFiling}
               variant="outlined"
               sx={{
                 width: "100%",
@@ -2331,50 +2294,9 @@ export function DocumentWorkspace({
                     id="field-wrapper-inbox"
                     onClick={() => setActiveHighlightField("inbox")}
                   >
-                    <Stack direction={{ xs: "column", sm: "row" }} spacing={1} sx={{ alignItems: { sm: "center" }, justifyContent: "space-between" }}>
-                      <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
-                        Inbox Type
-                      </Typography>
-                      <RadioGroup
-                        row
-                        value={selectedDocument.inbox || "Doctor's Inbox"}
-                        onChange={(_, value) => {
-                          const inbox = value === "Patient's File" ? "Patient's File" : "Doctor's Inbox";
-                          const isDoctorRequired = inbox !== "Patient's File";
-                          const assignedUser = inbox === "Patient's File" ? "" : selectedDocument.assignedUser;
-                          const currentDoctors =
-                            doctorRecordsRef.current.length > 0 ? doctorRecordsRef.current : doctorRecords;
-                          const matched = isDoctorRequired ? matchDoctorByName(assignedUser, currentDoctors) : null;
-                          const userVerified = Boolean(matched);
-                          const doctorId = matched?.id;
-                          const isVerified = isDocumentVerified({
-                            inbox,
-                            patientVerified: selectedDocument.patientVerified,
-                            userVerified,
-                          });
-
-                          updateDocument(selectedDocument.id, {
-                            inbox,
-                            assignedUser: matched ? matched.fullName : assignedUser,
-                            doctorId,
-                            userVerified,
-                            status: selectedDocument.status === "imported" ? "imported" : selectedDocument.status === "error" ? "error" : isVerified ? "verified" : "check",
-                          });
-                        }}
-                        aria-label="Inbox Type"
-                      >
-                        <FormControlLabel
-                          value="Doctor's Inbox"
-                          control={<Radio size="small" />}
-                          label="Doctor's Inbox"
-                        />
-                        <FormControlLabel
-                          value="Patient's File"
-                          control={<Radio size="small" />}
-                          label="Patient's File"
-                        />
-                      </RadioGroup>
-                    </Stack>
+                    <TextField label="Inbox Type" value={selectedDocument.inbox} fullWidth
+                      error={Boolean(filingErrors.inbox)} helperText={filingErrors.inbox || "Set automatically by the document category."}
+                      slotProps={{ input: { readOnly: true } }} />
                   </Box>
 
                   <Box
@@ -2382,43 +2304,25 @@ export function DocumentWorkspace({
                     onClick={() => setActiveHighlightField("patient")}
                   >
                     <Autocomplete
-                      options={availablePatients}
-                      value={selectedDocument.patient || null}
+                      disabled={isSelectedImported}
+                      clearText="Clear patient selection"
+                      options={patientDropdownOptions}
+                      getOptionKey={patientOptionKey}
+                      getOptionLabel={patientOptionLabel}
+                      isOptionEqualToValue={(option, value) => patientOptionKey(option) === patientOptionKey(value)}
+                      renderOption={(props, option) => <li {...props} key={patientOptionKey(option)}><Stack>
+                        <Typography>{patientOptionLabel(option)}</Typography>
+                        <Typography variant="caption">{option.kind === "database" ? `Verified database patient | ID: ${option.patient.id}` : "Original extracted patient | Create patient record"}</Typography>
+                      </Stack></li>}
+                      value={selectedPatientOption}
                       onFocus={() => setActiveHighlightField("patient")}
-                      onChange={(_, patient) => {
-                        const fullName = patient ?? "";
-                        const matchedRecord = patientRecords.find(
-                          (record) => record.fullName === fullName,
-                        );
-                        const dateOfBirth = matchedRecord?.dateOfBirth ?? selectedDocument.dateOfBirth;
-                        const patientVerified = Boolean(matchedRecord) || Boolean(fullName.trim());
-                        const isVerified = isDocumentVerified({
-                          inbox: selectedDocument.inbox,
-                          patientVerified,
-                          userVerified: selectedDocument.userVerified,
-                        });
-
-                        updateDocument(selectedDocument.id, {
-                          patient: fullName,
-                          patientId: matchedRecord?.id ?? selectedDocument.patientId,
-                          dateOfBirth,
-                          patientVerified,
-                          matchedIdentifierCount: matchedRecord ? 2 : (selectedDocument.matchedIdentifierCount || 1),
-                          status:
-                            selectedDocument.status === "imported"
-                              ? "imported"
-                              : selectedDocument.status === "error"
-                                ? "error"
-                                : isVerified
-                                  ? "verified"
-                                  : "check",
-                        });
-                        void verifyPatientMatch(selectedDocument.id, fullName, dateOfBirth);
-                      }}
+                      onChange={(_, option) => handlePatientSelection(selectedDocument, option)}
                       renderInput={(params) => (
                         <TextField
                           {...params}
                           label="Patient"
+                          error={Boolean(filingErrors.patient)}
+                          helperText={filingErrors.patient ? `${filingErrors.patient}${selectedDocument.patient ? ` Extracted name: ${selectedDocument.patient}` : ""}` : undefined}
                           placeholder="Search for a patient..."
                           required
                           onFocus={() => setActiveHighlightField("patient")}
@@ -2434,13 +2338,14 @@ export function DocumentWorkspace({
                   >
                     <TextField
                       label="Date of birth"
+                      disabled={isSelectedImported}
                       type="date"
                       fullWidth
                       value={selectedDocument.dateOfBirth}
                       onFocus={() => setActiveHighlightField("dateOfBirth")}
                       onChange={(event) => {
                         const dateOfBirth = event.target.value;
-                        updateDocument(selectedDocument.id, { dateOfBirth });
+                        updateDocument(selectedDocument.id, { dateOfBirth, patientId: undefined, patientVerified: false, matchedIdentifierCount: 0 });
                         void verifyPatientMatch(selectedDocument.id, selectedDocument.patient, dateOfBirth);
                       }}
                       slotProps={{ inputLabel: { shrink: true } }}
@@ -2473,6 +2378,7 @@ export function DocumentWorkspace({
                     <Button
                       variant="outlined"
                       onClick={handleOpenCreatePatientDialog}
+                      disabled={isSelectedImported}
                       sx={{ alignSelf: "flex-start" }}
                     >
                       Create New Patient
@@ -2486,6 +2392,9 @@ export function DocumentWorkspace({
                     <TextField
                       select
                       label="Category"
+                      disabled={isSelectedImported}
+                      error={Boolean(filingErrors.category)}
+                      helperText={filingErrors.category}
                       value={selectedDocument.category}
                       onFocus={() => setActiveHighlightField("category")}
                       onChange={(event) => handleCategoryChange(selectedDocument, event.target.value)}
@@ -2505,6 +2414,9 @@ export function DocumentWorkspace({
                   >
                     <TextField
                       label="Date of report"
+                      disabled={isSelectedImported}
+                      error={Boolean(filingErrors.reportDate)}
+                      helperText={filingErrors.reportDate}
                       type="date"
                       value={selectedDocument.reportDate}
                       onFocus={() => setActiveHighlightField("reportDate")}
@@ -2521,6 +2433,9 @@ export function DocumentWorkspace({
                   >
                     <TextField
                       label="Subject"
+                      disabled={isSelectedImported}
+                      error={Boolean(filingErrors.subject)}
+                      helperText={filingErrors.subject}
                       placeholder="e.g. Ultrasound of left foot"
                       value={selectedDocument.subject}
                       onFocus={() => setActiveHighlightField("subject")}
@@ -2536,6 +2451,10 @@ export function DocumentWorkspace({
                   >
                     <TextField
                       label="Contact of source"
+                      disabled={isSelectedImported}
+                      required
+                      error={Boolean(filingErrors.contact)}
+                      helperText={filingErrors.contact}
                       placeholder="e.g. Lakes Radiology"
                       value={selectedDocument.contact}
                       onFocus={() => setActiveHighlightField("contact")}
@@ -2551,6 +2470,9 @@ export function DocumentWorkspace({
                     <TextField
                       select
                       label="Store in"
+                      disabled={isSelectedImported}
+                      error={Boolean(filingErrors.storeIn)}
+                      helperText={filingErrors.storeIn}
                       value={selectedDocument.storeIn}
                       onFocus={() => setActiveHighlightField("storeIn")}
                       onChange={(event) => updateDocument(selectedDocument.id, { storeIn: event.target.value as StoreLocation })}
@@ -2578,25 +2500,23 @@ export function DocumentWorkspace({
                     ) : (
                       <Stack spacing={0.75}>
                         <Autocomplete
-                          freeSolo
-                          options={availableDoctors}
-                          value={selectedDocument.assignedUser || null}
+                          disabled={isSelectedImported}
+                          clearText="Clear GP selection"
+                          options={doctorRecords.filter((doctor) => doctor.active !== false && !doctor.id.startsWith("fallback-"))}
+                          getOptionKey={(doctor) => doctor.id}
+                          getOptionLabel={(doctor) => doctor.fullName}
+                          isOptionEqualToValue={(option, value) => option.id === value.id}
+                          renderOption={(props, doctor) => <li {...props} key={doctor.id}><Stack><Typography>{doctor.fullName}</Typography><Typography variant="caption">{doctor.email || ""} ? ID: {doctor.id}</Typography></Stack></li>}
+                          value={doctorRecords.find((doctor) => doctor.id === selectedDocument.doctorId && doctor.active !== false && !doctor.id.startsWith("fallback-")) ?? null}
                           onFocus={() => setActiveHighlightField("assignedUser")}
-                          onChange={(_, value) => {
-                            const doctorName = typeof value === "string" ? value : value ?? "";
-                            handleDoctorChange(selectedDocument.id, doctorName);
-                          }}
-                          onInputChange={(_, newInputValue, reason) => {
-                            if (reason === "input") {
-                              handleDoctorChange(selectedDocument.id, newInputValue);
-                            }
-                          }}
+                          onChange={(_, doctor) => handleDoctorSelection(selectedDocument, doctor)}
                           renderInput={(params) => (
                             <TextField
                               {...params}
                               label="User (GP Doctor)"
                               placeholder="Select or search for a GP doctor..."
-                              helperText="Select the GP doctor responsible for review, not the reporting specialist."
+                              error={Boolean(filingErrors.assignedUser)}
+                              helperText={filingErrors.assignedUser || "Select the GP doctor responsible for review, not the reporting specialist."}
                               required
                               fullWidth
                               onFocus={() => setActiveHighlightField("assignedUser")}
@@ -2629,13 +2549,9 @@ export function DocumentWorkspace({
                     color={selectedDocument.status === "imported" ? "info" : "primary"}
                     fullWidth
                     size="medium"
-                    disabled={getDocumentStatus(selectedDocument) !== "verified"}
+                    disabled={!canFileSelected || isFiling || isReprocessing}
                     startIcon={selectedDocument.status === "imported" ? <CheckIcon /> : <MoveToInboxIcon />}
-                    onClick={() => {
-                      if (getDocumentStatus(selectedDocument) !== "verified") return;
-                      updateDocument(selectedDocument.id, { status: "imported" });
-                      showNotice(`"${selectedDocument.name}" moved to Imported tab`);
-                    }}
+                    onClick={handleImportDocument}
                     sx={{
                       py: 1.25,
                       fontWeight: 700,
@@ -2648,7 +2564,7 @@ export function DocumentWorkspace({
                           : "none",
                     }}
                   >
-                    {selectedDocument.status === "imported" ? "Imported" : "Import Document"}
+                    {isFiling ? "Importing..." : selectedDocument.status === "imported" ? "Imported" : "Import Document"}
                   </Button>
                   {selectedDocument.status === "imported" ? (
                     <Typography
@@ -2658,29 +2574,13 @@ export function DocumentWorkspace({
                     >
                       Document imported successfully
                     </Typography>
-                  ) : getDocumentStatus(selectedDocument) === "error" ? (
-                    <Typography
-                      variant="caption"
-                      color="error.main"
-                      sx={{ display: "block", textAlign: "center", mt: 0.75, fontWeight: 500 }}
-                    >
-                      Resolve the error or reprocess document to enable import
-                    </Typography>
-                  ) : getDocumentStatus(selectedDocument) !== "verified" ? (
-                    <Typography
-                      variant="caption"
-                      color="text.secondary"
-                      sx={{ display: "block", textAlign: "center", mt: 0.75 }}
-                    >
-                      {selectedDocument.inbox === "Patient's File"
-                        ? "Verify the patient to enable import"
-                        : !selectedDocument.patientVerified && !selectedDocument.userVerified
-                          ? "Verify patient and doctor to enable import"
-                          : !selectedDocument.patientVerified
-                            ? "Verify the patient to enable import"
-                            : "Verify the GP doctor to enable import"}
-                    </Typography>
+                  ) : Object.keys(filingErrors).length > 0 ? (
+                    <Alert severity="warning" sx={{ mt: 1 }}>
+                      <Typography variant="body2">Complete the following before importing:</Typography>
+                      <Box component="ul" sx={{ my: 0.5, pl: 2 }}>{Object.entries(filingErrors).map(([field, message]) => <li key={field}>{message}</li>)}</Box>
+                    </Alert>
                   ) : null}
+                  {filingError?.documentId === selectedDocument.id && <Alert severity="error" sx={{ mt: 1 }}>{filingError.message}</Alert>}
                 </Box>
 
                 <Divider sx={{ my: 1.5 }} />
@@ -2698,7 +2598,7 @@ export function DocumentWorkspace({
                         <RefreshIcon />
                       )
                     }
-                    disabled={isReprocessing}
+                    disabled={isReprocessing || isSelectedImported}
                     onClick={handleReprocessDocument}
                     sx={{
                       py: 0.9,
@@ -2718,7 +2618,7 @@ export function DocumentWorkspace({
                       fullWidth
                       size="medium"
                       startIcon={<RestartAltIcon />}
-                      disabled={isReprocessing}
+                      disabled={isReprocessing || isSelectedImported}
                       onClick={handleResetDocumentToDefault}
                       sx={{
                         py: 0.85,
@@ -2743,7 +2643,7 @@ export function DocumentWorkspace({
                       fullWidth
                       size="medium"
                       startIcon={<FlagOutlinedIcon />}
-                      disabled={isReprocessing}
+                      disabled={isReprocessing || isSelectedImported}
                       onClick={handleOpenReportErrorDialog}
                       sx={{
                         py: 0.85,
@@ -2783,7 +2683,7 @@ export function DocumentWorkspace({
               <Button
                 variant="contained"
                 startIcon={<CloudUploadOutlinedIcon />}
-                disabled={!documentsLoaded || isImporting}
+                disabled={!documentsLoaded || isImporting || isFiling}
                 onClick={() => uploadInput.current?.click()}
                 sx={{ mt: 1 }}
               >

@@ -66,3 +66,9 @@ it("surfaces recycling and restoration errors", async () => {
   await expect(deleteWorkspaceDocumentsFromDb(["doc"])).rejects.toThrow("conflict");
   await expect(restoreWorkspaceDocumentFromDb("doc", "check")).rejects.toThrow("conflict");
 });
+
+
+it("reloads original extraction metadata independently of the selected patient", async () => {
+  from.mockReturnValue(queryMock([{ id: "doc", file_name: "Test.pdf", status: "check", patient_name: "Selected Database Patient", patient_id: "p1", patient_verified: true, extracted_patient: { name: "Original OCR Patient", dateOfBirth: "2000-01-01" } }]).query);
+  expect((await listWorkspaceDocuments("user"))[0]).toMatchObject({ patient: "Selected Database Patient", extractedPatient: { name: "Original OCR Patient", dateOfBirth: "2000-01-01" } });
+});

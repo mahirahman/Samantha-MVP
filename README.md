@@ -48,6 +48,18 @@ Auto Bulk Import sends each pending file to the authenticated `POST /api/documen
 
 Copy `backend/.env.example` to `backend/.env` and set `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, `AZURE_DOCUMENT_INTELLIGENCE_KEY`, and `GOOGLE_API_KEY`; `GOOGLE_GENAI_MODEL` defaults to `gemini-3.5-flash-lite`. Keep these keys out of source control; configure them as ECS Secrets Manager/Parameter Store values for deployment. The published Azure JavaScript SDK is `@azure/ai-form-recognizer` (the requested `@azure/ai-document-intelligence` package is not available in the configured npm registry); it is the official SDK for Azure Document Intelligence. The supplied Google API key uses the Gemini Developer API. To use Vertex AI instead, set `GOOGLE_GENAI_USE_VERTEXAI=true` and configure Google Cloud project/location plus Application Default Credentials; an API key alone does not authenticate Vertex AI.
 
+## Filing validation
+
+Apply `supabase/migrations/20261105070000_atomic_document_filing.sql` after the existing workspace persistence and recycle-bin migrations. The application requires a verified database patient, report date, subject, Contact of source, inbox, storage location and category; Doctor's Inbox also requires a verified database GP. Import status, extraction metadata and the filing record are saved by one authenticated database transaction. The interface reports success only after that transaction commits and keeps the document in Queue on failure.
+
+Apply `supabase/migrations/20261105080000_strict_identity_and_category_routing.sql` after the atomic-filing migration. Patient and GP pickers select database records by ID and display identifying details. Automatic matching accepts only a unique record matching every supplied patient identifier; an ambiguous result needs explicit selection. Missing/failed doctor queries never supply demo doctors. Filing checks patient name/DOB and GP name against their selected IDs and rejects category/inbox conflicts.
+
+Category determines Inbox Type and its default Store in value. Changing category resets storage to that default and removes the GP assignment when review is not required. Staff can override storage with **Batch Store in ? Apply to selected** in Queue or **Store in for this batch** before bulk allocation. A storage override never changes the category-driven Inbox Type.
+
+Apply `supabase/migrations/20261105090000_preserve_extracted_patient.sql` after the strict-verification migration to retain original OCR patient details separately from the selected database patient. Each document's patient picker contains only its original extraction (marked as requiring a patient record) and database patients. Returning to the extracted choice restores its name, DOB and demographics and clears the database association. Older documents are backfilled where the original name can be recovered from their extraction demographics or unverified name; reprocess documents whose original extraction is no longer available.
+
+The filing database tests use isolated in-memory PostgreSQL (PGlite), including rollback and retry checks. They do not connect to your Supabase project or apply migrations remotely.
+
 ## Supabase authentication
 
 In Supabase, open **Authentication → URL Configuration** and set the Site URL to `http://localhost:3000`. Add `http://localhost:3000/**` to the Redirect URLs list. For deployment, add `https://YOUR_ACTUAL_VERCEL_DOMAIN/**` and use the exact Vercel domain; these allowlisted URLs are needed for email confirmation and password recovery redirects.

@@ -17,14 +17,15 @@ function toPatientRecord(row: PatientRow): PatientRecord {
 }
 
 export async function listPatients(): Promise<PatientRecord[]> {
-  const { data, error } = await getSupabaseClient()
-    .from("patients")
-    .select("id, full_name, date_of_birth")
-    .order("full_name", { ascending: true });
-
-  if (error) throw error;
-
-  return ((data as PatientRow[] | null) ?? []).map(toPatientRecord);
+  const rows: PatientRow[] = [];
+  for (let offset = 0; ; offset += 1000) {
+    const { data, error } = await getSupabaseClient().from("patients")
+      .select("id, full_name, date_of_birth").order("full_name", { ascending: true }).order("id").range(offset, offset + 999);
+    if (error) throw error;
+    rows.push(...((data ?? []) as PatientRow[]));
+    if (!data || data.length < 1000) break;
+  }
+  return rows.map(toPatientRecord);
 }
 
 export interface PatientMatch {
@@ -35,59 +36,31 @@ export interface PatientMatch {
 
 const totalIdentifierCount = 2; // name + date of birth
 
-/**
- * Looks up candidate patients independently by name and by date of birth,
- * then scores how many identifiers (name, date of birth) match the single
- * best candidate. A document is considered identified once at least one
- * identifier matches; the count drives the "N identifier(s) verified"
- * confidence indicator shown to staff.
- *
- * If name and date of birth each match a *different* patient, the result is
- * ambiguous and treated as no match, so staff must resolve it manually
- * rather than risk filing against the wrong patient.
- */
-export async function matchPatientIdentifiers(
-  fullName: string,
-  dateOfBirth: string,
-): Promise<PatientMatch | null> {
-  const trimmedName = (fullName ?? "").trim();
-  const trimmedDob = (dateOfBirth ?? "").trim();
-  if (!trimmedName && !trimmedDob) return null;
-
+/** Auto-verifies only a unique database record matching every supplied identifier. */
+export async function matchPatientIdentifiers(fullName: string, dateOfBirth: string): Promise<PatientMatch | null> {
+  const name = (fullName ?? "").trim();
+  const dob = (dateOfBirth ?? "").trim();
+  if (!name && !dob) return null;
   const client = getSupabaseClient();
-  const [nameResult, dobResult] = await Promise.all([
-    trimmedName
-      ? client.from("patients").select("id, full_name, date_of_birth").ilike("full_name", trimmedName)
-      : Promise.resolve({ data: [] as PatientRow[], error: null }),
-    trimmedDob
-      ? client.from("patients").select("id, full_name, date_of_birth").eq("date_of_birth", trimmedDob)
-      : Promise.resolve({ data: [] as PatientRow[], error: null }),
-  ]);
-
-  if (nameResult.error) throw nameResult.error;
-  if (dobResult.error) throw dobResult.error;
-
-  const nameMatches = (nameResult.data as PatientRow[] | null) ?? [];
-  const dobMatches = (dobResult.data as PatientRow[] | null) ?? [];
-
-  const bothMatch = nameMatches.find((nameRow) =>
-    dobMatches.some((dobRow) => dobRow.id === nameRow.id),
-  );
-  if (bothMatch) {
-    return { patient: toPatientRecord(bothMatch), matchedIdentifierCount: 2, totalIdentifiers: totalIdentifierCount };
+  async function candidates(column: "full_name" | "date_of_birth", value: string): Promise<PatientRow[]> {
+    if (!value) return [];
+    const rows: PatientRow[] = [];
+    for (let offset = 0; ; offset += 1000) {
+      let query = client.from("patients").select("id, full_name, date_of_birth").order("id").range(offset, offset + 999);
+      query = column === "full_name" ? query.ilike(column, value.replace(/[\\%_]/g, (character) => `\\${character}`)) : query.eq(column, value);
+      const { data, error } = await query;
+      if (error) throw error;
+      rows.push(...((data ?? []) as PatientRow[]));
+      if (!data || data.length < 1000) break;
+    }
+    // Also compare literally so SQL wildcard characters never broaden a match.
+    return rows.filter((row) => row[column].trim().toLowerCase() === value.toLowerCase());
   }
-
-  // Name and DOB each matched, but to different patients - ambiguous.
-  if (nameMatches.length > 0 && dobMatches.length > 0) return null;
-
-  if (nameMatches.length > 0) {
-    return { patient: toPatientRecord(nameMatches[0]), matchedIdentifierCount: 1, totalIdentifiers: totalIdentifierCount };
-  }
-  if (dobMatches.length > 0) {
-    return { patient: toPatientRecord(dobMatches[0]), matchedIdentifierCount: 1, totalIdentifiers: totalIdentifierCount };
-  }
-
-  return null;
+  const [byName, byDob] = await Promise.all([candidates("full_name", name), candidates("date_of_birth", dob)]);
+  const matches = name && dob ? byName.filter((row) => byDob.some((other) => other.id === row.id)) : name ? byName : byDob;
+  const unique = [...new Map(matches.map((row) => [row.id, row])).values()];
+  if (unique.length !== 1) return null;
+  return { patient: toPatientRecord(unique[0]), matchedIdentifierCount: name && dob ? 2 : 1, totalIdentifiers: totalIdentifierCount };
 }
 
 export interface FullPatientRecord {
