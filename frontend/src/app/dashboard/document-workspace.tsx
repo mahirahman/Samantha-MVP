@@ -1714,7 +1714,7 @@ export function DocumentWorkspace({
               stickyHeader
               size="small"
               aria-label={`${activeTab} documents`}
-              sx={{ width: "100%", tableLayout: "fixed" }}
+              sx={{ width: "100%", minWidth: 680, tableLayout: "fixed" }}
             >
               <TableHead>
                 <TableRow>
@@ -1731,7 +1731,7 @@ export function DocumentWorkspace({
                   </TableCell>
                   <TableCell sx={{ width: { xs: 28, sm: 36 }, px: { xs: 0.5, sm: 0.75 }, fontWeight: 700 }}>#</TableCell>
                   <TableCell sx={{ width: 104, px: 0.5, fontWeight: 700 }}>FILE</TableCell>
-                  <TableCell sx={{ width: { xs: 68, sm: 90 }, px: { xs: 0.25, sm: 0.5 }, fontWeight: 700 }}>STATUS</TableCell>
+                  <TableCell sx={{ width: 100, px: 0.5, fontWeight: 700 }}>STATUS</TableCell>
                   <TableCell sx={{ width: { xs: 68, sm: 90 }, px: { xs: 0.25, sm: 0.5 }, fontWeight: 700 }}>INBOX</TableCell>
                   <TableCell sx={{ width: { xs: 80, sm: 110 }, px: { xs: 0.25, sm: 0.5 }, fontWeight: 700 }}>PATIENT</TableCell>
                   <TableCell sx={{ width: { xs: 85, sm: 120 }, px: { xs: 0.25, sm: 0.5 }, fontWeight: 700 }}>USER</TableCell>
@@ -1763,7 +1763,7 @@ export function DocumentWorkspace({
                       </Tooltip>
                       {activeTab === "recycle" && document.deletedAt && <Typography variant="caption" color="text.secondary">{new Date(document.deletedAt).toLocaleDateString()}</Typography>}
                     </TableCell>
-                    <TableCell>
+                    <TableCell sx={{ px: 0.5, whiteSpace: "nowrap" }}>
                       <StatusChip status={getDocumentStatus(document)} />
                     </TableCell>
                     <TableCell sx={{ px: { xs: 0.25, sm: 0.5 }, overflow: "hidden", textOverflow: "ellipsis" }}>
@@ -2912,12 +2912,11 @@ function StatusChip({ status }: { status: DocumentStatus }) {
       label={label}
       color={color}
       sx={{
-        maxWidth: "100%",
-        height: "auto",
-        minHeight: 24,
+        flexShrink: 0,
+        height: 24,
         fontWeight: 700,
         fontSize: { xs: "0.65rem", sm: "0.8125rem" },
-        "& .MuiChip-label": { px: 0.75, py: 0.25, whiteSpace: "normal", overflowWrap: "anywhere", textAlign: "center" },
+        "& .MuiChip-label": { px: 0.75, py: 0.25, whiteSpace: "nowrap", textAlign: "center" },
       }}
     />
   );
