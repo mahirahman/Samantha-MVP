@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, type ChangeEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type ChangeEvent } from "react";
 import Alert from "@mui/material/Alert";
 import Autocomplete from "@mui/material/Autocomplete";
 import AppBar from "@mui/material/AppBar";
@@ -36,7 +36,9 @@ import TextField from "@mui/material/TextField";
 import Tabs from "@mui/material/Tabs";
 import Tooltip from "@mui/material/Tooltip";
 import Typography from "@mui/material/Typography";
+import ArrowBackIcon from "@mui/icons-material/ArrowBack";
 import AutoAwesomeIcon from "@mui/icons-material/AutoAwesome";
+import CheckIcon from "@mui/icons-material/Check";
 import KeyboardArrowLeftIcon from "@mui/icons-material/KeyboardArrowLeft";
 import KeyboardArrowRightIcon from "@mui/icons-material/KeyboardArrowRight";
 import ClearAllIcon from "@mui/icons-material/ClearAll";
@@ -64,7 +66,23 @@ import {
   saveImportFolderName,
   type ImportDirectoryHandle,
 } from "@/lib/import-folder";
-import { processDocumentFile } from "@/lib/document-processing";
+import { processDocumentFile, type DocumentHighlight } from "@/lib/document-processing";
+import { InteractiveDocumentViewer } from "./interactive-document-viewer";
+import {
+  createPatient,
+  emptyNewPatientInput,
+  getPatientById,
+  listPatients,
+  matchPatientIdentifiers,
+  type FullPatientRecord,
+  type NewPatientInput,
+  type PatientRecord,
+} from "@/lib/patients";
+import {
+  listDoctors,
+  matchDoctorByName,
+  type DoctorRecord,
+} from "@/lib/doctors";
 
 type DocumentStatus = "check" | "verified" | "error" | "imported";
 type QueueTab = "queue" | "imported" | "errors";
@@ -117,6 +135,11 @@ interface DocumentItem {
   status: DocumentStatus;
   inbox: string;
   patient: string;
+  patientId?: string;
+  dateOfBirth: string;
+  patientVerified: boolean;
+  matchedIdentifierCount: number;
+  demographics: NewPatientInput;
   fileSize: number;
   fileLastModified: number;
   reportDate: string;
@@ -124,11 +147,14 @@ interface DocumentItem {
   contact: string;
   storeIn: StoreLocation;
   assignedUser: string;
+  doctorId?: string;
+  userVerified: boolean;
   category: string;
   ocrCharacterCount?: number;
   processingError?: string;
   mimeType?: string;
   previewUrl?: string;
+  highlights?: DocumentHighlight[];
 }
 
 interface DocumentWorkspaceProps {
@@ -154,6 +180,27 @@ const statusInfo: Record<
   imported: { label: "Imported", color: "info" },
 };
 
+export function isDocumentVerified(document: {
+  inbox: string;
+  patientVerified: boolean;
+  userVerified: boolean;
+}): boolean {
+  if (!document.patientVerified) {
+    return false;
+  }
+  if (document.inbox === "Patient's File") {
+    return true;
+  }
+  return document.userVerified;
+}
+
+export function getDocumentStatus(document: DocumentItem): DocumentStatus {
+  if (document.status === "imported") return "imported";
+  if (isDocumentVerified(document)) return "verified";
+  if (document.status === "error") return "error";
+  return "check";
+}
+
 export function DocumentWorkspace({
   email,
   userId,
@@ -164,9 +211,16 @@ export function DocumentWorkspace({
   const [folderFiles, setFolderFiles] = useState<File[]>([]);
   const [folderHandle, setFolderHandle] = useState<ImportDirectoryHandle | null>(null);
   const [folderName, setFolderName] = useState("");
-  const [patientOptions, setPatientOptions] = useState<string[]>([]);
-  const [newPatientDialogOpen, setNewPatientDialogOpen] = useState(false);
-  const [newPatientName, setNewPatientName] = useState("");
+  const [patientRecords, setPatientRecords] = useState<PatientRecord[]>([]);
+  const [doctorRecords, setDoctorRecords] = useState<DoctorRecord[]>([]);
+  const doctorRecordsRef = useRef<DoctorRecord[]>([]);
+  const [rightPanelMode, setRightPanelMode] = useState<
+    "document-info" | "show-patient" | "create-patient"
+  >("document-info");
+  const [newPatientForm, setNewPatientForm] = useState<NewPatientInput>(emptyNewPatientInput());
+  const [isCreatingPatient, setIsCreatingPatient] = useState(false);
+  const [viewedPatientRecord, setViewedPatientRecord] = useState<FullPatientRecord | null>(null);
+  const [isLoadingPatientRecord, setIsLoadingPatientRecord] = useState(false);
   const [isImporting, setIsImporting] = useState(false);
   const [processingProgress, setProcessingProgress] = useState<ProcessingProgress | null>(
     null,
@@ -174,6 +228,7 @@ export function DocumentWorkspace({
   const [activeTab, setActiveTab] = useState<QueueTab>("queue");
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [selectedDocumentId, setSelectedDocumentId] = useState<string | null>(null);
+  const [activeHighlightField, setActiveHighlightField] = useState<string | null>(null);
   const [expanded, setExpanded] = useState(false);
   const [notice, setNotice] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -207,6 +262,45 @@ export function DocumentWorkspace({
     };
   }, [userId]);
 
+  useEffect(() => {
+    let isActive = true;
+
+    void listPatients()
+      .then((records) => {
+        if (isActive) setPatientRecords(records);
+      })
+      .catch(() => {
+        if (isActive) {
+          setNotice("Could not load patients from the database");
+        }
+      });
+
+    return () => {
+      isActive = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    let isActive = true;
+
+    void listDoctors()
+      .then((records) => {
+        if (isActive) {
+          setDoctorRecords(records);
+          doctorRecordsRef.current = records;
+        }
+      })
+      .catch(() => {
+        if (isActive) {
+          setNotice("Could not load doctors from the database");
+        }
+      });
+
+    return () => {
+      isActive = false;
+    };
+  }, []);
+
   useEffect(
     () => () => {
       previewUrls.current.forEach((url) => URL.revokeObjectURL(url));
@@ -214,16 +308,38 @@ export function DocumentWorkspace({
     [],
   );
 
-  const queueDocuments = documents.filter(
-    (document) => document.status === "check" || document.status === "verified",
-  );
+  useEffect(() => {
+    setRightPanelMode("document-info");
+    setViewedPatientRecord(null);
+    setActiveHighlightField(null);
+  }, [selectedDocumentId]);
+
+  const handleSelectHighlightField = useCallback((fieldName: string) => {
+    setActiveHighlightField(fieldName);
+    setRightPanelMode("document-info");
+    const wrapper = window.document.getElementById(`field-wrapper-${fieldName}`);
+    if (wrapper) {
+      wrapper.scrollIntoView({ behavior: "smooth", block: "center" });
+      const input = wrapper.querySelector("input, select, textarea") as HTMLElement | null;
+      if (input) {
+        input.focus();
+      }
+    }
+  }, []);
+
+  const queueDocuments = documents.filter((document) => {
+    const s = getDocumentStatus(document);
+    return s === "check" || s === "verified";
+  });
   const pendingQueueDocuments = queueDocuments.filter(
-    (document) => document.status === "check",
+    (document) => getDocumentStatus(document) === "check",
   );
   const importedDocuments = documents.filter(
-    (document) => document.status === "imported",
+    (document) => getDocumentStatus(document) === "imported",
   );
-  const errorDocuments = documents.filter((document) => document.status === "error");
+  const errorDocuments = documents.filter(
+    (document) => getDocumentStatus(document) === "error",
+  );
   const visibleDocuments =
     activeTab === "queue"
       ? queueDocuments
@@ -239,16 +355,24 @@ export function DocumentWorkspace({
   const selectedCount = selectedIds.size;
   const dataReviewIssues = selectedDocument
     ? [
-        !selectedDocument.patient && "Patient not found in database",
-        !selectedDocument.assignedUser && "User not found in database",
+        !selectedDocument.patientVerified && "Patient not found in database",
+        selectedDocument.inbox !== "Patient's File" &&
+          !selectedDocument.userVerified &&
+          "User not found in database",
       ].filter((issue): issue is string => Boolean(issue))
     : [];
   const availablePatients = Array.from(
     new Set([
-      ...patientOptions,
+      ...patientRecords.map((patient) => patient.fullName),
       ...documents.map((document) => document.patient).filter(Boolean),
     ]),
-  ).filter((patient) => patient !== "Not Found");
+  );
+  const availableDoctors = Array.from(
+    new Set([
+      ...doctorRecords.map((doctor) => doctor.fullName),
+      ...documents.map((document) => document.assignedUser).filter(Boolean),
+    ]),
+  );
   const needsFolderAccess = Boolean(
     folderName && !folderHandle && folderFiles.length === 0,
   );
@@ -278,6 +402,10 @@ export function DocumentWorkspace({
         status,
         inbox: "Doctor's Inbox",
         patient: "",
+        dateOfBirth: "",
+        patientVerified: false,
+        matchedIdentifierCount: 0,
+        demographics: emptyNewPatientInput(),
         fileSize: file.size,
         fileLastModified: file.lastModified,
         reportDate: new Date(file.lastModified || Date.now()).toISOString().slice(0, 10),
@@ -285,6 +413,8 @@ export function DocumentWorkspace({
         contact: "",
         storeIn: "Correspondence",
         assignedUser: "",
+        doctorId: undefined,
+        userVerified: false,
         category: "",
         mimeType: file.type,
         previewUrl,
@@ -309,16 +439,82 @@ export function DocumentWorkspace({
     });
   }
 
-  function handleCreatePatient() {
-    const name = newPatientName.trim();
-    if (!name || !selectedDocument) return;
+  function handleOpenCreatePatientDialog() {
+    if (!selectedDocument) return;
 
-    setPatientOptions((current) =>
-      current.includes(name) ? current : [...current, name],
-    );
-    updateDocument(selectedDocument.id, { patient: name });
-    setNewPatientName("");
-    setNewPatientDialogOpen(false);
+    const demographics = selectedDocument.demographics ?? emptyNewPatientInput();
+    let { firstName, lastName } = demographics;
+    if (!firstName && !lastName && selectedDocument.patient) {
+      const split = splitFullName(selectedDocument.patient);
+      firstName = split.firstName;
+      lastName = split.lastName;
+    }
+
+    setNewPatientForm({
+      ...demographics,
+      firstName,
+      lastName,
+      dateOfBirth: demographics.dateOfBirth || selectedDocument.dateOfBirth || "",
+    });
+    setRightPanelMode("create-patient");
+  }
+
+  function updateNewPatientField(field: keyof NewPatientInput, value: string) {
+    setNewPatientForm((current) => ({ ...current, [field]: value }));
+  }
+
+  async function handleShowPatientRecord() {
+    if (!selectedDocument?.patientId) return;
+
+    setRightPanelMode("show-patient");
+    setIsLoadingPatientRecord(true);
+    try {
+      const record = await getPatientById(selectedDocument.patientId);
+      setViewedPatientRecord(record);
+    } catch (error) {
+      showNotice(
+        error instanceof Error ? error.message : "Unable to load the patient record",
+      );
+      setRightPanelMode("document-info");
+    } finally {
+      setIsLoadingPatientRecord(false);
+    }
+  }
+
+  async function handleCreatePatient() {
+    const firstName = (newPatientForm.firstName ?? "").trim();
+    const lastName = (newPatientForm.lastName ?? "").trim();
+    const dateOfBirth = (newPatientForm.dateOfBirth ?? "").trim();
+    if (!firstName || !lastName || !dateOfBirth || !selectedDocument) return;
+
+    setIsCreatingPatient(true);
+    try {
+      const patient = await createPatient(newPatientForm);
+      setPatientRecords((current) => [...current, patient].sort(
+        (a, b) => a.fullName.localeCompare(b.fullName),
+      ));
+      const isVerified = isDocumentVerified({
+        inbox: selectedDocument.inbox,
+        patientVerified: true,
+        userVerified: selectedDocument.userVerified,
+      });
+      updateDocument(selectedDocument.id, {
+        patient: patient.fullName,
+        patientId: patient.id,
+        dateOfBirth: patient.dateOfBirth,
+        patientVerified: true,
+        matchedIdentifierCount: 2,
+        status: isVerified ? "verified" : "check",
+      });
+      setNewPatientForm(emptyNewPatientInput());
+      setRightPanelMode("document-info");
+    } catch (error) {
+      showNotice(
+        error instanceof Error ? error.message : "Unable to create the patient",
+      );
+    } finally {
+      setIsCreatingPatient(false);
+    }
   }
 
   async function handleUpload(event: ChangeEvent<HTMLInputElement>) {
@@ -345,7 +541,7 @@ export function DocumentWorkspace({
         if (document.status !== "error") {
           try {
             const result = await processDocumentFile(files[index]);
-            processedDocument = mapExtraction(document, result);
+            processedDocument = await mapExtraction(document, result);
             successfulCount += 1;
           } catch (error) {
             processedDocument = {
@@ -613,7 +809,7 @@ export function DocumentWorkspace({
             lastModified: document.fileLastModified,
           });
           const processed = await processDocumentFile(file);
-          queueUpdates.set(document.id, mapExtraction(document, processed));
+          queueUpdates.set(document.id, await mapExtraction(document, processed));
         } catch (error) {
           queueUpdates.set(document.id, {
             status: "error",
@@ -641,7 +837,7 @@ export function DocumentWorkspace({
 
         try {
           const processed = await processDocumentFile(file);
-          folderDocuments.push(mapExtraction(document, processed));
+          folderDocuments.push(await mapExtraction(document, processed));
         } catch (error) {
           folderDocuments.push({
             ...document,
@@ -670,8 +866,8 @@ export function DocumentWorkspace({
         ...Array.from(queueUpdates.values()).filter((updates) => updates.status === "error"),
       ].length;
       const successfulCount =
-        folderDocuments.filter((document) => document.status === "verified").length +
-        Array.from(queueUpdates.values()).filter((updates) => updates.status === "verified").length;
+        folderDocuments.filter((document) => document.status !== "error").length +
+        Array.from(queueUpdates.values()).filter((updates) => updates.status !== "error").length;
 
       if (pendingQueueDocuments.length === 0 && folderDocuments.length === 0) {
         showNotice(folderHandle ? `No files found in ${folderName}` : "No new files to process");
@@ -697,10 +893,10 @@ export function DocumentWorkspace({
     }
   }
 
-  function mapExtraction(
+  async function mapExtraction(
     document: DocumentItem,
     result: Awaited<ReturnType<typeof processDocumentFile>>,
-  ): DocumentItem {
+  ): Promise<DocumentItem> {
     const extraction = result.extraction;
     const inbox = importDestination === "doctor-inbox"
       ? "Doctor's Inbox"
@@ -708,20 +904,161 @@ export function DocumentWorkspace({
         ? "Patient's File"
         : extraction.inboxType || "Doctor's Inbox";
 
+    let patientVerified = false;
+    let patientId: string | undefined;
+    let matchedIdentifierCount = 0;
+    try {
+      const match = await matchPatientIdentifiers(extraction.patientName, extraction.patientDateOfBirth);
+      patientVerified = Boolean(match);
+      patientId = match?.patient.id;
+      matchedIdentifierCount = match?.matchedIdentifierCount ?? 0;
+    } catch {
+      patientVerified = false;
+    }
+
+    const demographics: NewPatientInput = {
+      title: extraction.patientTitle,
+      firstName: extraction.patientFirstName,
+      lastName: extraction.patientLastName,
+      middleName: extraction.patientMiddleName,
+      preferredName: extraction.patientPreferredName,
+      dateOfBirth: extraction.patientDateOfBirth,
+      gender: extraction.patientGender,
+      addressLine1: extraction.patientAddressLine1,
+      addressLine2: extraction.patientAddressLine2,
+      city: extraction.patientCity,
+      postcode: extraction.patientPostcode,
+      postalAddress: extraction.patientPostalAddress,
+      postalCity: extraction.patientPostalCity,
+      postalPostcode: extraction.patientPostalPostcode,
+      medicareNumber: extraction.patientMedicareNumber,
+      medicareIrn: extraction.patientMedicareIrn,
+      medicareExpiry: extraction.patientMedicareExpiry,
+      mobileNumber: extraction.patientMobileNumber,
+      homePhone: extraction.patientHomePhone,
+      workPhone: extraction.patientWorkPhone,
+      email: extraction.patientEmail,
+      pensionTypeCode: extraction.patientPensionTypeCode,
+      pensionNumber: extraction.patientPensionNumber,
+      pensionExpiry: extraction.patientPensionExpiry,
+      dvaTypeCode: extraction.patientDvaTypeCode,
+      dvaNumber: extraction.patientDvaNumber,
+      externalId: extraction.patientExternalId,
+    };
+
+    let userVerified = false;
+    let doctorId: string | undefined;
+    let assignedUser = "";
+
+    if (inbox !== "Patient's File") {
+      const rawDoctor = extraction.gpDoctor?.trim() || "";
+      const currentDoctors =
+        doctorRecordsRef.current.length > 0
+          ? doctorRecordsRef.current
+          : await listDoctors().catch(() => []);
+      const matchedDoctor = matchDoctorByName(rawDoctor, currentDoctors);
+      if (matchedDoctor) {
+        userVerified = true;
+        doctorId = matchedDoctor.id;
+        assignedUser = matchedDoctor.fullName;
+      } else {
+        userVerified = false;
+        assignedUser = rawDoctor;
+      }
+    }
+
+    const isVerified = isDocumentVerified({
+      inbox,
+      patientVerified,
+      userVerified,
+    });
+
     return {
       ...document,
-      status: "verified",
+      status: isVerified ? "verified" : "check",
       patient: extraction.patientName,
+      patientId,
+      dateOfBirth: extraction.patientDateOfBirth,
+      patientVerified,
+      matchedIdentifierCount,
+      demographics,
       reportDate: extraction.reportDate || document.reportDate,
       subject: extraction.subject,
       contact: extraction.sourceContact,
       inbox,
       storeIn: extraction.storeIn || document.storeIn,
-      assignedUser: extraction.gpDoctor,
+      assignedUser,
+      doctorId,
+      userVerified,
       category: extraction.category,
       ocrCharacterCount: result.ocrCharacterCount,
       processingError: undefined,
+      highlights: result.highlights ?? [],
     };
+  }
+
+  /**
+   * Re-checks whether a document's patient name + date of birth match an
+   * existing database record, and promotes/demotes the document between
+   * "check" and "verified" accordingly. Used both after automatic extraction
+   * and after manual edits to the patient or date of birth fields.
+   */
+  async function verifyPatientMatch(
+    documentId: string,
+    fullName: string,
+    dateOfBirth: string,
+  ) {
+    try {
+      const match = await matchPatientIdentifiers(fullName, dateOfBirth);
+      const patientVerified = Boolean(match);
+      setDocuments((current) =>
+        current.map((item) => {
+          if (item.id !== documentId) return item;
+          const isVerified = isDocumentVerified({
+            inbox: item.inbox,
+            patientVerified,
+            userVerified: item.userVerified,
+          });
+          return {
+            ...item,
+            patientVerified,
+            patientId: match?.patient.id ?? item.patientId,
+            matchedIdentifierCount: match?.matchedIdentifierCount ?? (patientVerified ? 2 : 0),
+            status: item.status === "imported" ? "imported" : isVerified ? "verified" : "check",
+          };
+        }),
+      );
+    } catch {
+      showNotice("Could not verify the patient against the database");
+    }
+  }
+
+  function handleDoctorChange(documentId: string, doctorName: string) {
+    const trimmed = (doctorName ?? "").trim();
+    const currentDoctors =
+      doctorRecordsRef.current.length > 0 ? doctorRecordsRef.current : doctorRecords;
+    const matchedDoctor = matchDoctorByName(trimmed, currentDoctors);
+    const userVerified = Boolean(matchedDoctor);
+    const doctorId = matchedDoctor?.id;
+    const assignedUser = matchedDoctor ? matchedDoctor.fullName : trimmed;
+
+    setDocuments((current) =>
+      current.map((item) => {
+        if (item.id !== documentId) return item;
+        const isVerified = isDocumentVerified({
+          inbox: item.inbox,
+          patientVerified: item.patientVerified,
+          userVerified,
+        });
+        return {
+          ...item,
+          assignedUser,
+          doctorId,
+          userVerified,
+          status: item.status === "imported" ? "imported" : isVerified ? "verified" : "check",
+        };
+      }),
+    );
   }
 
   function handleClearQueue() {
@@ -1182,10 +1519,10 @@ export function DocumentWorkspace({
                     />
                   </TableCell>
                   <TableCell sx={{ width: { xs: 28, sm: 36 }, px: { xs: 0.5, sm: 0.75 }, fontWeight: 700 }}>#</TableCell>
-                  <TableCell sx={{ width: { xs: 72, sm: 100 }, px: { xs: 0.25, sm: 0.5 }, fontWeight: 700 }}>STATUS</TableCell>
-                  <TableCell sx={{ width: { xs: 68, sm: 95 }, px: { xs: 0.25, sm: 0.5 }, fontWeight: 700 }}>INBOX</TableCell>
-                  <TableCell sx={{ width: { xs: 74, sm: 90 }, px: { xs: 0.25, sm: 0.5 }, fontWeight: 700 }}>PATIENT</TableCell>
-                  <TableCell sx={{ width: { xs: 90, sm: 130 }, px: { xs: 0.25, sm: 0.5 }, fontWeight: 700 }}>USER</TableCell>
+                  <TableCell sx={{ width: { xs: 68, sm: 90 }, px: { xs: 0.25, sm: 0.5 }, fontWeight: 700 }}>STATUS</TableCell>
+                  <TableCell sx={{ width: { xs: 68, sm: 90 }, px: { xs: 0.25, sm: 0.5 }, fontWeight: 700 }}>INBOX</TableCell>
+                  <TableCell sx={{ width: { xs: 80, sm: 110 }, px: { xs: 0.25, sm: 0.5 }, fontWeight: 700 }}>PATIENT</TableCell>
+                  <TableCell sx={{ width: { xs: 85, sm: 120 }, px: { xs: 0.25, sm: 0.5 }, fontWeight: 700 }}>USER</TableCell>
                 </TableRow>
               </TableHead>
               <TableBody>
@@ -1207,18 +1544,66 @@ export function DocumentWorkspace({
                     </TableCell>
                     <TableCell sx={{ px: { xs: 0.5, sm: 0.5 } }}>{index + 1}</TableCell>
                     <TableCell>
-                      <StatusChip status={document.status} />
+                      <StatusChip status={getDocumentStatus(document)} />
                     </TableCell>
                     <TableCell sx={{ px: { xs: 0.25, sm: 0.5 }, overflow: "hidden", textOverflow: "ellipsis" }}>
                       {document.inbox}
                     </TableCell>
-                    <TableCell sx={{ px: { xs: 0.25, sm: 0.5 }, overflow: "hidden", textOverflow: "ellipsis", color: document.patient === "Not Found" ? "error.dark" : "primary.main" }}>
-                      {document.patient}
+                    <TableCell sx={{ px: { xs: 0.25, sm: 0.5 }, overflow: "hidden" }}>
+                      <Stack direction="row" spacing={0.5} sx={{ alignItems: "center", minWidth: 0 }}>
+                        {document.patientVerified && (
+                          <CheckIcon
+                            sx={{ color: "success.main", fontSize: 16, flexShrink: 0 }}
+                            titleAccess="Patient verified"
+                          />
+                        )}
+                        <Typography
+                          variant="body2"
+                          noWrap
+                          sx={{
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            color: document.patientVerified ? "primary.main" : "error.dark",
+                            fontWeight: document.patientVerified ? 500 : 400,
+                          }}
+                          title={document.patient || "Not Found"}
+                        >
+                          {document.patient || "Not Found"}
+                        </Typography>
+                      </Stack>
                     </TableCell>
                     <TableCell sx={{ px: { xs: 0.25, sm: 0.5 }, overflow: "hidden" }}>
-                      <Typography variant="body2" noWrap title={email}>
-                        {email || "—"}
-                      </Typography>
+                      {document.inbox === "Patient's File" ? (
+                        <Typography variant="body2" color="text.secondary" noWrap>
+                          —
+                        </Typography>
+                      ) : (
+                        <Stack direction="row" spacing={0.5} sx={{ alignItems: "center", minWidth: 0 }}>
+                          {document.userVerified && (
+                            <CheckIcon
+                              sx={{ color: "success.main", fontSize: 16, flexShrink: 0 }}
+                              titleAccess="User verified"
+                            />
+                          )}
+                          <Typography
+                            variant="body2"
+                            noWrap
+                            sx={{
+                              overflow: "hidden",
+                              textOverflow: "ellipsis",
+                              color: document.userVerified
+                                ? "primary.main"
+                                : document.assignedUser
+                                  ? "error.dark"
+                                  : "text.secondary",
+                              fontWeight: document.userVerified ? 500 : 400,
+                            }}
+                            title={document.assignedUser || "Not Found"}
+                          >
+                            {document.assignedUser || "Not Found"}
+                          </Typography>
+                        </Stack>
+                      )}
                     </TableCell>
                   </TableRow>
                 ))}
@@ -1242,19 +1627,13 @@ export function DocumentWorkspace({
             bgcolor: "#edf1f4",
           }}
         >
-          {selectedDocument?.previewUrl && isPdfDocument(selectedDocument) ? (
-            <Box
-              component="iframe"
-              src={selectedDocument.previewUrl}
-              title={`PDF preview of ${selectedDocument.name}`}
-              sx={{ width: "100%", height: "100%", minHeight: 480, border: 0, bgcolor: "#fff" }}
-            />
-          ) : selectedDocument?.previewUrl && selectedDocument.mimeType?.startsWith("image/") ? (
-            <Box
-              component="img"
-              src={selectedDocument.previewUrl}
-              alt={`Preview of ${selectedDocument.name}`}
-              sx={{ display: "block", maxWidth: "100%", maxHeight: "100%", objectFit: "contain" }}
+          {selectedDocument?.previewUrl &&
+          (isPdfDocument(selectedDocument) || selectedDocument.mimeType?.startsWith("image/")) ? (
+            <InteractiveDocumentViewer
+              document={selectedDocument}
+              activeField={activeHighlightField}
+              onSelectField={handleSelectHighlightField}
+              onClearActiveField={() => setActiveHighlightField(null)}
             />
           ) : selectedDocument?.previewUrl && isDocxDocument(selectedDocument) ? (
             <DocxPreview key={selectedDocument.id} document={selectedDocument} />
@@ -1297,7 +1676,376 @@ export function DocumentWorkspace({
                 overflow: "auto",
               }}
             >
-              <Stack spacing={2.25}>
+              {rightPanelMode === "create-patient" ? (
+                <Stack spacing={2.25}>
+                  <Box>
+                    <Stack direction="row" spacing={1} sx={{ alignItems: "center" }}>
+                      <Button
+                        variant="outlined"
+                        size="small"
+                        startIcon={<ArrowBackIcon />}
+                        onClick={() => setRightPanelMode("document-info")}
+                      >
+                        Back
+                      </Button>
+                      <Typography component="h2" variant="h6" sx={{ flex: 1, fontWeight: 700 }}>
+                        Create New Patient
+                      </Typography>
+                    </Stack>
+                    <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+                      Fill in the patient details to register in the database.
+                    </Typography>
+                  </Box>
+
+                  <Divider />
+
+                  <Stack spacing={2.5}>
+                    <Stack spacing={1.5}>
+                      <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
+                        Personal Details
+                      </Typography>
+                      <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", sm: "1fr 1fr" }, gap: 1.5 }}>
+                        <TextField
+                          size="small"
+                          label="Title"
+                          value={newPatientForm.title}
+                          onChange={(event) => updateNewPatientField("title", event.target.value)}
+                        />
+                        <TextField
+                          size="small"
+                          label="Gender"
+                          value={newPatientForm.gender}
+                          onChange={(event) => updateNewPatientField("gender", event.target.value)}
+                        />
+                        <TextField
+                          size="small"
+                          autoFocus
+                          label="First Name"
+                          value={newPatientForm.firstName}
+                          onChange={(event) => updateNewPatientField("firstName", event.target.value)}
+                          required
+                        />
+                        <TextField
+                          size="small"
+                          label="Last Name"
+                          value={newPatientForm.lastName}
+                          onChange={(event) => updateNewPatientField("lastName", event.target.value)}
+                          required
+                        />
+                        <TextField
+                          size="small"
+                          label="Middle Name"
+                          value={newPatientForm.middleName}
+                          onChange={(event) => updateNewPatientField("middleName", event.target.value)}
+                        />
+                        <TextField
+                          size="small"
+                          label="Preferred Name"
+                          value={newPatientForm.preferredName}
+                          onChange={(event) => updateNewPatientField("preferredName", event.target.value)}
+                        />
+                        <TextField
+                          size="small"
+                          label="Date of Birth"
+                          type="date"
+                          value={newPatientForm.dateOfBirth}
+                          onChange={(event) => updateNewPatientField("dateOfBirth", event.target.value)}
+                          slotProps={{ inputLabel: { shrink: true } }}
+                          required
+                        />
+                      </Box>
+                    </Stack>
+
+                    <Divider />
+
+                    <Stack spacing={1.5}>
+                      <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
+                        Address
+                      </Typography>
+                      <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", sm: "1fr 1fr" }, gap: 1.5 }}>
+                        <TextField
+                          size="small"
+                          label="Address"
+                          value={newPatientForm.addressLine1}
+                          onChange={(event) => updateNewPatientField("addressLine1", event.target.value)}
+                        />
+                        <TextField
+                          size="small"
+                          label="Address Line 2"
+                          value={newPatientForm.addressLine2}
+                          onChange={(event) => updateNewPatientField("addressLine2", event.target.value)}
+                        />
+                        <TextField
+                          size="small"
+                          label="City"
+                          value={newPatientForm.city}
+                          onChange={(event) => updateNewPatientField("city", event.target.value)}
+                        />
+                        <TextField
+                          size="small"
+                          label="Postcode"
+                          value={newPatientForm.postcode}
+                          onChange={(event) => updateNewPatientField("postcode", event.target.value)}
+                        />
+                        <TextField
+                          size="small"
+                          label="Postal Address"
+                          value={newPatientForm.postalAddress}
+                          onChange={(event) => updateNewPatientField("postalAddress", event.target.value)}
+                        />
+                        <TextField
+                          size="small"
+                          label="Postal City"
+                          value={newPatientForm.postalCity}
+                          onChange={(event) => updateNewPatientField("postalCity", event.target.value)}
+                        />
+                        <TextField
+                          size="small"
+                          label="Postal Postcode"
+                          value={newPatientForm.postalPostcode}
+                          onChange={(event) => updateNewPatientField("postalPostcode", event.target.value)}
+                        />
+                      </Box>
+                    </Stack>
+
+                    <Divider />
+
+                    <Stack spacing={1.5}>
+                      <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
+                        Medicare
+                      </Typography>
+                      <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", sm: "1fr 1fr" }, gap: 1.5 }}>
+                        <TextField
+                          size="small"
+                          label="Medicare Number"
+                          value={newPatientForm.medicareNumber}
+                          onChange={(event) => updateNewPatientField("medicareNumber", event.target.value)}
+                        />
+                        <TextField
+                          size="small"
+                          label="Medicare IRN (Line No)"
+                          value={newPatientForm.medicareIrn}
+                          onChange={(event) => updateNewPatientField("medicareIrn", event.target.value)}
+                        />
+                        <TextField
+                          size="small"
+                          label="Medicare Expiry"
+                          placeholder="MM/YYYY"
+                          value={newPatientForm.medicareExpiry}
+                          onChange={(event) => updateNewPatientField("medicareExpiry", event.target.value)}
+                        />
+                      </Box>
+                    </Stack>
+
+                    <Divider />
+
+                    <Stack spacing={1.5}>
+                      <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
+                        Contact
+                      </Typography>
+                      <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", sm: "1fr 1fr" }, gap: 1.5 }}>
+                        <TextField
+                          size="small"
+                          label="Mobile Number"
+                          value={newPatientForm.mobileNumber}
+                          onChange={(event) => updateNewPatientField("mobileNumber", event.target.value)}
+                        />
+                        <TextField
+                          size="small"
+                          label="Home Phone"
+                          value={newPatientForm.homePhone}
+                          onChange={(event) => updateNewPatientField("homePhone", event.target.value)}
+                        />
+                        <TextField
+                          size="small"
+                          label="Work Phone"
+                          value={newPatientForm.workPhone}
+                          onChange={(event) => updateNewPatientField("workPhone", event.target.value)}
+                        />
+                        <TextField
+                          size="small"
+                          label="Email"
+                          type="email"
+                          value={newPatientForm.email}
+                          onChange={(event) => updateNewPatientField("email", event.target.value)}
+                        />
+                      </Box>
+                    </Stack>
+
+                    <Divider />
+
+                    <Stack spacing={1.5}>
+                      <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
+                        Pension &amp; DVA
+                      </Typography>
+                      <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", sm: "1fr 1fr" }, gap: 1.5 }}>
+                        <TextField
+                          size="small"
+                          label="Pension Type Code"
+                          value={newPatientForm.pensionTypeCode}
+                          onChange={(event) => updateNewPatientField("pensionTypeCode", event.target.value)}
+                        />
+                        <TextField
+                          size="small"
+                          label="Pension/HCC Number"
+                          value={newPatientForm.pensionNumber}
+                          onChange={(event) => updateNewPatientField("pensionNumber", event.target.value)}
+                        />
+                        <TextField
+                          size="small"
+                          label="Pension Expiry"
+                          placeholder="MM/YYYY"
+                          value={newPatientForm.pensionExpiry}
+                          onChange={(event) => updateNewPatientField("pensionExpiry", event.target.value)}
+                        />
+                        <TextField
+                          size="small"
+                          label="DVA Type Code"
+                          value={newPatientForm.dvaTypeCode}
+                          onChange={(event) => updateNewPatientField("dvaTypeCode", event.target.value)}
+                        />
+                        <TextField
+                          size="small"
+                          label="DVA Number"
+                          value={newPatientForm.dvaNumber}
+                          onChange={(event) => updateNewPatientField("dvaNumber", event.target.value)}
+                        />
+                        <TextField
+                          size="small"
+                          label="External ID"
+                          value={newPatientForm.externalId}
+                          onChange={(event) => updateNewPatientField("externalId", event.target.value)}
+                        />
+                      </Box>
+                    </Stack>
+
+                    <Divider />
+
+                    <Stack direction="row" spacing={1.5} sx={{ justifyContent: "flex-end", pt: 1, pb: 1 }}>
+                      <Button
+                        variant="outlined"
+                        startIcon={<ArrowBackIcon />}
+                        onClick={() => setRightPanelMode("document-info")}
+                      >
+                        Back
+                      </Button>
+                      <Button
+                        onClick={handleCreatePatient}
+                        variant="contained"
+                        disabled={
+                          !(newPatientForm.firstName ?? "").trim() ||
+                          !(newPatientForm.lastName ?? "").trim() ||
+                          !(newPatientForm.dateOfBirth ?? "").trim() ||
+                          isCreatingPatient
+                        }
+                      >
+                        {isCreatingPatient ? "Creating..." : "Create New Patient"}
+                      </Button>
+                    </Stack>
+                  </Stack>
+                </Stack>
+              ) : rightPanelMode === "show-patient" ? (
+                <Stack spacing={2.25}>
+                  <Box>
+                    <Stack direction="row" spacing={1} sx={{ alignItems: "center" }}>
+                      <Button
+                        variant="outlined"
+                        size="small"
+                        startIcon={<ArrowBackIcon />}
+                        onClick={() => {
+                          setRightPanelMode("document-info");
+                          setViewedPatientRecord(null);
+                        }}
+                      >
+                        Back
+                      </Button>
+                      <Typography component="h2" variant="h6" sx={{ flex: 1, fontWeight: 700 }} noWrap>
+                        Patient Record
+                      </Typography>
+                    </Stack>
+                    {viewedPatientRecord?.fullName && (
+                      <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5, fontWeight: 600 }}>
+                        {viewedPatientRecord.fullName}
+                      </Typography>
+                    )}
+                  </Box>
+
+                  <Divider />
+
+                  {isLoadingPatientRecord ? (
+                    <Stack sx={{ alignItems: "center", py: 6 }}>
+                      <CircularProgress />
+                    </Stack>
+                  ) : viewedPatientRecord ? (
+                    <Stack spacing={2.5}>
+                      <PatientRecordSection
+                        title="Personal Details"
+                        fields={[
+                          ["Full Name", viewedPatientRecord.fullName],
+                          ["Title", viewedPatientRecord.title],
+                          ["First Name", viewedPatientRecord.firstName || splitFullName(viewedPatientRecord.fullName).firstName],
+                          ["Last Name", viewedPatientRecord.lastName || splitFullName(viewedPatientRecord.fullName).lastName],
+                          ["Middle Name", viewedPatientRecord.middleName],
+                          ["Preferred Name", viewedPatientRecord.preferredName],
+                          ["Date of Birth", viewedPatientRecord.dateOfBirth],
+                          ["Gender", viewedPatientRecord.gender],
+                          ["Medical Record Number", viewedPatientRecord.medicalRecordNumber],
+                        ]}
+                      />
+                      <Divider />
+                      <PatientRecordSection
+                        title="Address"
+                        fields={[
+                          ["Address", viewedPatientRecord.addressLine1],
+                          ["Address Line 2", viewedPatientRecord.addressLine2],
+                          ["City", viewedPatientRecord.city],
+                          ["Postcode", viewedPatientRecord.postcode],
+                          ["Postal Address", viewedPatientRecord.postalAddress],
+                          ["Postal City", viewedPatientRecord.postalCity],
+                          ["Postal Postcode", viewedPatientRecord.postalPostcode],
+                        ]}
+                      />
+                      <Divider />
+                      <PatientRecordSection
+                        title="Medicare"
+                        fields={[
+                          ["Medicare Number", viewedPatientRecord.medicareNumber],
+                          ["Medicare IRN (Line No)", viewedPatientRecord.medicareIrn],
+                          ["Medicare Expiry", viewedPatientRecord.medicareExpiry],
+                        ]}
+                      />
+                      <Divider />
+                      <PatientRecordSection
+                        title="Contact"
+                        fields={[
+                          ["Mobile Number", viewedPatientRecord.mobileNumber],
+                          ["Home Phone", viewedPatientRecord.homePhone],
+                          ["Work Phone", viewedPatientRecord.workPhone],
+                          ["Email", viewedPatientRecord.email],
+                        ]}
+                      />
+                      <Divider />
+                      <PatientRecordSection
+                        title="Pension & DVA"
+                        fields={[
+                          ["Pension Type Code", viewedPatientRecord.pensionTypeCode],
+                          ["Pension/HCC Number", viewedPatientRecord.pensionNumber],
+                          ["Pension Expiry", viewedPatientRecord.pensionExpiry],
+                          ["DVA Type Code", viewedPatientRecord.dvaTypeCode],
+                          ["DVA Number", viewedPatientRecord.dvaNumber],
+                          ["External ID", viewedPatientRecord.externalId],
+                        ]}
+                      />
+                      <Divider />
+                    </Stack>
+                  ) : (
+                    <Typography variant="body2" color="text.secondary">
+                      No record details available.
+                    </Typography>
+                  )}
+                </Stack>
+              ) : (
+                <Stack spacing={2.25}>
                 <Box>
                   <Stack direction="row" spacing={1} sx={{ alignItems: "center" }}>
                     <Typography component="h2" variant="h6" sx={{ flex: 1, fontWeight: 700 }}>
@@ -1365,7 +2113,10 @@ export function DocumentWorkspace({
                 <Divider />
 
                 <Stack spacing={2}>
-                  <Box>
+                  <Box
+                    id="field-wrapper-inbox"
+                    onClick={() => setActiveHighlightField("inbox")}
+                  >
                     <Stack direction={{ xs: "column", sm: "row" }} spacing={1} sx={{ alignItems: { sm: "center" }, justifyContent: "space-between" }}>
                       <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
                         Inbox Type
@@ -1373,9 +2124,28 @@ export function DocumentWorkspace({
                       <RadioGroup
                         row
                         value={selectedDocument.inbox || "Doctor's Inbox"}
-                        onChange={(_, inbox) =>
-                          updateDocument(selectedDocument.id, { inbox })
-                        }
+                        onChange={(_, inbox) => {
+                          const isDoctorRequired = inbox !== "Patient's File";
+                          const assignedUser = inbox === "Patient's File" ? "" : selectedDocument.assignedUser;
+                          const currentDoctors =
+                            doctorRecordsRef.current.length > 0 ? doctorRecordsRef.current : doctorRecords;
+                          const matched = isDoctorRequired ? matchDoctorByName(assignedUser, currentDoctors) : null;
+                          const userVerified = Boolean(matched);
+                          const doctorId = matched?.id;
+                          const isVerified = isDocumentVerified({
+                            inbox,
+                            patientVerified: selectedDocument.patientVerified,
+                            userVerified,
+                          });
+
+                          updateDocument(selectedDocument.id, {
+                            inbox,
+                            assignedUser: matched ? matched.fullName : assignedUser,
+                            doctorId,
+                            userVerified,
+                            status: selectedDocument.status === "imported" ? "imported" : isVerified ? "verified" : "check",
+                          });
+                        }}
                         aria-label="Inbox Type"
                       >
                         <FormControlLabel
@@ -1392,92 +2162,231 @@ export function DocumentWorkspace({
                     </Stack>
                   </Box>
 
-                  <Autocomplete
-                    options={availablePatients}
-                    value={selectedDocument.patient || null}
-                    onChange={(_, patient) => updateDocument(selectedDocument.id, { patient: patient ?? "" })}
-                    renderInput={(params) => (
+                  <Box
+                    id="field-wrapper-patient"
+                    onClick={() => setActiveHighlightField("patient")}
+                  >
+                    <Autocomplete
+                      options={availablePatients}
+                      value={selectedDocument.patient || null}
+                      onFocus={() => setActiveHighlightField("patient")}
+                      onChange={(_, patient) => {
+                        const fullName = patient ?? "";
+                        const matchedRecord = patientRecords.find(
+                          (record) => record.fullName === fullName,
+                        );
+                        const dateOfBirth = matchedRecord?.dateOfBirth ?? selectedDocument.dateOfBirth;
+                        updateDocument(selectedDocument.id, { patient: fullName, dateOfBirth });
+                        void verifyPatientMatch(selectedDocument.id, fullName, dateOfBirth);
+                      }}
+                      renderInput={(params) => (
+                        <TextField
+                          {...params}
+                          label="Patient"
+                          placeholder="Search for a patient..."
+                          required
+                          onFocus={() => setActiveHighlightField("patient")}
+                        />
+                      )}
+                      noOptionsText="No patients available"
+                    />
+                  </Box>
+
+                  <Box
+                    id="field-wrapper-dateOfBirth"
+                    onClick={() => setActiveHighlightField("dateOfBirth")}
+                  >
+                    <TextField
+                      label="Date of birth"
+                      type="date"
+                      fullWidth
+                      value={selectedDocument.dateOfBirth}
+                      onFocus={() => setActiveHighlightField("dateOfBirth")}
+                      onChange={(event) => {
+                        const dateOfBirth = event.target.value;
+                        updateDocument(selectedDocument.id, { dateOfBirth });
+                        void verifyPatientMatch(selectedDocument.id, selectedDocument.patient, dateOfBirth);
+                      }}
+                      slotProps={{ inputLabel: { shrink: true } }}
+                      required
+                    />
+                  </Box>
+
+                  {selectedDocument.patientVerified ? (
+                    <Stack
+                      direction="row"
+                      spacing={1}
+                      sx={{ alignItems: "center", justifyContent: "space-between" }}
+                    >
+                      <Stack direction="row" spacing={0.5} sx={{ alignItems: "center" }}>
+                        <Typography variant="body2" color="text.secondary">
+                          {selectedDocument.matchedIdentifierCount} identifier
+                          {selectedDocument.matchedIdentifierCount === 1 ? "" : "s"} verified
+                        </Typography>
+                      </Stack>
+                      <Button
+                        size="small"
+                        variant="outlined"
+                        onClick={handleShowPatientRecord}
+                        disabled={!selectedDocument.patientId}
+                      >
+                        Show Patient Record
+                      </Button>
+                    </Stack>
+                  ) : (
+                    <Button
+                      variant="outlined"
+                      onClick={handleOpenCreatePatientDialog}
+                      sx={{ alignSelf: "flex-start" }}
+                    >
+                      Create New Patient
+                    </Button>
+                  )}
+
+                  <Box
+                    id="field-wrapper-category"
+                    onClick={() => setActiveHighlightField("category")}
+                  >
+                    <TextField
+                      select
+                      label="Category"
+                      value={selectedDocument.category}
+                      onFocus={() => setActiveHighlightField("category")}
+                      onChange={(event) => handleCategoryChange(selectedDocument, event.target.value)}
+                      required
+                      fullWidth
+                    >
+                      <MenuItem value=""><em>Select category</em></MenuItem>
+                      {documentCategories.map((category) => (
+                        <MenuItem key={category} value={category}>{category}</MenuItem>
+                      ))}
+                    </TextField>
+                  </Box>
+
+                  <Box
+                    id="field-wrapper-reportDate"
+                    onClick={() => setActiveHighlightField("reportDate")}
+                  >
+                    <TextField
+                      label="Date of report"
+                      type="date"
+                      value={selectedDocument.reportDate}
+                      onFocus={() => setActiveHighlightField("reportDate")}
+                      onChange={(event) => updateDocument(selectedDocument.id, { reportDate: event.target.value })}
+                      slotProps={{ inputLabel: { shrink: true } }}
+                      required
+                      fullWidth
+                    />
+                  </Box>
+
+                  <Box
+                    id="field-wrapper-subject"
+                    onClick={() => setActiveHighlightField("subject")}
+                  >
+                    <TextField
+                      label="Subject"
+                      placeholder="e.g. Ultrasound of left foot"
+                      value={selectedDocument.subject}
+                      onFocus={() => setActiveHighlightField("subject")}
+                      onChange={(event) => updateDocument(selectedDocument.id, { subject: event.target.value })}
+                      required
+                      fullWidth
+                    />
+                  </Box>
+
+                  <Box
+                    id="field-wrapper-contact"
+                    onClick={() => setActiveHighlightField("contact")}
+                  >
+                    <TextField
+                      label="Contact of source"
+                      placeholder="e.g. Lakes Radiology"
+                      value={selectedDocument.contact}
+                      onFocus={() => setActiveHighlightField("contact")}
+                      onChange={(event) => updateDocument(selectedDocument.id, { contact: event.target.value })}
+                      fullWidth
+                    />
+                  </Box>
+
+                  <Box
+                    id="field-wrapper-storeIn"
+                    onClick={() => setActiveHighlightField("storeIn")}
+                  >
+                    <TextField
+                      select
+                      label="Store in"
+                      value={selectedDocument.storeIn}
+                      onFocus={() => setActiveHighlightField("storeIn")}
+                      onChange={(event) => updateDocument(selectedDocument.id, { storeIn: event.target.value as StoreLocation })}
+                      required
+                      fullWidth
+                    >
+                      <MenuItem value="Correspondence">Correspondence</MenuItem>
+                      <MenuItem value="Investigations">Investigations</MenuItem>
+                    </TextField>
+                  </Box>
+
+                  <Box
+                    id="field-wrapper-assignedUser"
+                    onClick={() => setActiveHighlightField("assignedUser")}
+                  >
+                    {selectedDocument.inbox === "Patient's File" ? (
                       <TextField
-                        {...params}
-                        label="Patient"
-                        placeholder="Search for a patient..."
-                        required
+                        label="User (GP Doctor)"
+                        value="None"
+                        helperText="No GP review is required for Patient's File documents."
+                        fullWidth
+                        onFocus={() => setActiveHighlightField("assignedUser")}
+                        slotProps={{ input: { readOnly: true } }}
                       />
+                    ) : (
+                      <Stack spacing={0.75}>
+                        <Autocomplete
+                          freeSolo
+                          options={availableDoctors}
+                          value={selectedDocument.assignedUser || null}
+                          onFocus={() => setActiveHighlightField("assignedUser")}
+                          onChange={(_, value) => {
+                            const doctorName = typeof value === "string" ? value : value ?? "";
+                            handleDoctorChange(selectedDocument.id, doctorName);
+                          }}
+                          onInputChange={(_, newInputValue, reason) => {
+                            if (reason === "input") {
+                              handleDoctorChange(selectedDocument.id, newInputValue);
+                            }
+                          }}
+                          renderInput={(params) => (
+                            <TextField
+                              {...params}
+                              label="User (GP Doctor)"
+                              placeholder="Select or search for a GP doctor..."
+                              helperText="Select the GP doctor responsible for review, not the reporting specialist."
+                              required
+                              fullWidth
+                              onFocus={() => setActiveHighlightField("assignedUser")}
+                            />
+                          )}
+                          noOptionsText="No doctors available in database"
+                        />
+                        {selectedDocument.userVerified ? (
+                          <Stack direction="row" spacing={0.5} sx={{ alignItems: "center" }}>
+                            <CheckIcon sx={{ color: "success.main", fontSize: 16 }} />
+                            <Typography variant="body2" color="text.secondary">
+                              Doctor verified in database
+                            </Typography>
+                          </Stack>
+                        ) : selectedDocument.assignedUser ? (
+                          <Typography variant="caption" color="error.dark">
+                            Doctor not found in database
+                          </Typography>
+                        ) : null}
+                      </Stack>
                     )}
-                    noOptionsText="No patients available"
-                  />
-                  <Button
-                    variant="outlined"
-                    onClick={() => setNewPatientDialogOpen(true)}
-                    sx={{ alignSelf: "flex-start" }}
-                  >
-                    Create New Patient
-                  </Button>
-
-                  <TextField
-                    select
-                    label="Category"
-                    value={selectedDocument.category}
-                    onChange={(event) => handleCategoryChange(selectedDocument, event.target.value)}
-                    required
-                    fullWidth
-                  >
-                    <MenuItem value=""><em>Select category</em></MenuItem>
-                    {documentCategories.map((category) => (
-                      <MenuItem key={category} value={category}>{category}</MenuItem>
-                    ))}
-                  </TextField>
-
-                  <TextField
-                    label="Date of report"
-                    type="date"
-                    value={selectedDocument.reportDate}
-                    onChange={(event) => updateDocument(selectedDocument.id, { reportDate: event.target.value })}
-                    slotProps={{ inputLabel: { shrink: true } }}
-                    required
-                    fullWidth
-                  />
-
-                  <TextField
-                    label="Subject"
-                    placeholder="e.g. Ultrasound of left foot"
-                    value={selectedDocument.subject}
-                    onChange={(event) => updateDocument(selectedDocument.id, { subject: event.target.value })}
-                    required
-                    fullWidth
-                  />
-
-                  <TextField
-                    label="Contact of source"
-                    placeholder="e.g. Lakes Radiology"
-                    value={selectedDocument.contact}
-                    onChange={(event) => updateDocument(selectedDocument.id, { contact: event.target.value })}
-                    fullWidth
-                  />
-
-                  <TextField
-                    select
-                    label="Store in"
-                    value={selectedDocument.storeIn}
-                    onChange={(event) => updateDocument(selectedDocument.id, { storeIn: event.target.value as StoreLocation })}
-                    required
-                    fullWidth
-                  >
-                    <MenuItem value="Correspondence">Correspondence</MenuItem>
-                    <MenuItem value="Investigations">Investigations</MenuItem>
-                  </TextField>
-
-                  <TextField
-                    label="User (GP Doctor)"
-                    placeholder="e.g. Dr Smith"
-                    value={selectedDocument.assignedUser}
-                    onChange={(event) => updateDocument(selectedDocument.id, { assignedUser: event.target.value })}
-                    helperText="Enter the GP doctor responsible for review, not the reporting specialist."
-                    fullWidth
-                  />
+                  </Box>
                 </Stack>
               </Stack>
-            </Paper>
+            )}
+          </Paper>
           ) : (
             <Stack spacing={1.5} sx={{ maxWidth: 480, textAlign: "center", alignItems: "center" }}>
               <Box
@@ -1512,36 +2421,10 @@ export function DocumentWorkspace({
       </Box>
 
       <Dialog
-        open={newPatientDialogOpen}
-        onClose={() => setNewPatientDialogOpen(false)}
-        fullWidth
-        maxWidth="xs"
-      >
-        <DialogTitle>Create New Patient</DialogTitle>
-        <DialogContent>
-          <TextField
-            autoFocus
-            label="Patient name"
-            value={newPatientName}
-            onChange={(event) => setNewPatientName(event.target.value)}
-            required
-            fullWidth
-            sx={{ mt: 1 }}
-          />
-        </DialogContent>
-        <DialogActions>
-          <Button onClick={() => setNewPatientDialogOpen(false)}>Cancel</Button>
-          <Button onClick={handleCreatePatient} variant="contained" disabled={!newPatientName.trim()}>
-            Create patient
-          </Button>
-        </DialogActions>
-      </Dialog>
-
-      <Dialog
         open={Boolean(processingProgress)}
         maxWidth="xs"
         fullWidth
-        disableEscapeKeyDown
+        onClose={() => {}}
         slotProps={{ backdrop: { sx: { pointerEvents: "none" } } }}
       >
         <DialogTitle>Processing Documents</DialogTitle>
@@ -1593,6 +2476,45 @@ function TabLabel({ label, count }: { label: string; count: number }) {
         {label}
       </Typography>
     </Badge>
+  );
+}
+
+/**
+ * Best-effort split of a single full-name string into first/last name parts,
+ * used as a display/prefill fallback when a patient record predates the
+ * dedicated first_name/last_name columns (e.g. legacy or seeded data).
+ */
+function splitFullName(fullName: string): { firstName: string; lastName: string } {
+  const parts = fullName.trim().split(/\s+/).filter(Boolean);
+  return {
+    firstName: parts[0] ?? "",
+    lastName: parts.length > 1 ? parts.slice(1).join(" ") : "",
+  };
+}
+
+function PatientRecordSection({
+  title,
+  fields,
+}: {
+  title: string;
+  fields: [string, string][];
+}) {
+  return (
+    <Stack spacing={1.5}>
+      <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
+        {title}
+      </Typography>
+      <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", sm: "1fr 1fr" }, gap: 1.5 }}>
+        {fields.map(([label, value]) => (
+          <Box key={label}>
+            <Typography variant="caption" color="text.secondary">
+              {label}
+            </Typography>
+            <Typography variant="body2">{value || "—"}</Typography>
+          </Box>
+        ))}
+      </Box>
+    </Stack>
   );
 }
 
