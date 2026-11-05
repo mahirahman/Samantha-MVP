@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import Box from "@mui/material/Box";
+import Alert from "@mui/material/Alert";
 import CircularProgress from "@mui/material/CircularProgress";
 import { getSupabaseClient } from "@/lib/supabase";
 import { DocumentWorkspace } from "./document-workspace";
@@ -65,6 +66,10 @@ export default function DashboardPage() {
         error instanceof Error ? error.message : "Unable to sign out.",
       );
     }
+  }
+
+  if (!isLoading && !userId && errorMessage) {
+    return <Alert severity="error">{errorMessage}</Alert>;
   }
 
   if (isLoading || !userId) {

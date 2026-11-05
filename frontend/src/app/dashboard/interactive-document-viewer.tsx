@@ -445,7 +445,7 @@ export function InteractiveDocumentViewer({
         <Stack direction="row" spacing={0.5} sx={{ alignItems: "center" }}>
           <Tooltip title="Zoom out">
             <span>
-              <IconButton size="small" onClick={handleZoomOut} disabled={scale <= 0.5}>
+              <IconButton aria-label="Zoom out" size="small" onClick={handleZoomOut} disabled={scale <= 0.5}>
                 <ZoomOutIcon fontSize="small" />
               </IconButton>
             </span>
@@ -464,7 +464,7 @@ export function InteractiveDocumentViewer({
           </Typography>
           <Tooltip title="Zoom in">
             <span>
-              <IconButton size="small" onClick={handleZoomIn} disabled={scale >= 2.5}>
+              <IconButton aria-label="Zoom in" size="small" onClick={handleZoomIn} disabled={scale >= 2.5}>
                 <ZoomInIcon fontSize="small" />
               </IconButton>
             </span>

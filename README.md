@@ -8,6 +8,19 @@ A small TypeScript monorepo with independently deployable frontend and backend a
 - `backend/`: NestJS API, packaged as a Docker image for AWS ECS Fargate.
 - `infrastructure/aws/`: AWS CDK application for the Fargate service and public Application Load Balancer.
 
+## Unit tests
+
+Run the suites from the repository root (install dependencies in each application first):
+
+```powershell
+npm --prefix backend test
+npm --prefix frontend test
+```
+
+Use `npm --prefix frontend run test:watch` or `npm --prefix backend run test:watch` while editing. Both applications also provide `test:cov` for coverage reports.
+
+The lightweight tests cover backend health, authentication, upload validation, OCR/Gemini processing and errors; frontend login/signup and routing, patient/doctor matching, document persistence, duplicate uploads, bulk import, filing, recycle/restore, folder preferences, PDF split/merge and previews. Cloud SDKs, database requests and HTTP calls are mocked. PDF split/merge tests use real in-memory PDFs, and folder preference tests use an in-memory IndexedDB. No real patient data, credentials or paid services are needed. These are unit/component tests; they do not exercise live Supabase policies, external OCR accuracy or browser canvas rendering.
+
 ## Local development
 
 Install dependencies in each application directory, then run its development server:

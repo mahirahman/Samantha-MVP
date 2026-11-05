@@ -73,6 +73,8 @@ import { processDocumentFile } from "@/lib/document-processing";
 import { InteractiveDocumentViewer } from "./interactive-document-viewer";
 import {
   createPatient,
+  validateNewPatientInput,
+  getPatientCreationErrorMessage,
   emptyNewPatientInput,
   getPatientById,
   listPatients,
@@ -205,6 +207,9 @@ export function DocumentWorkspace({
   >("document-info");
   const [newPatientForm, setNewPatientForm] = useState<NewPatientInput>(emptyNewPatientInput());
   const [isCreatingPatient, setIsCreatingPatient] = useState(false);
+  const [showPatientValidation, setShowPatientValidation] = useState(false);
+  const [patientCreationError, setPatientCreationError] = useState("");
+  const patientFormErrors = showPatientValidation ? validateNewPatientInput(newPatientForm) : {};
   const [viewedPatientRecord, setViewedPatientRecord] = useState<FullPatientRecord | null>(null);
   const [isLoadingPatientRecord, setIsLoadingPatientRecord] = useState(false);
   const [isImporting, setIsImporting] = useState(false);
@@ -462,6 +467,8 @@ export function DocumentWorkspace({
 
   function handleOpenCreatePatientDialog() {
     if (!selectedDocument) return;
+    setShowPatientValidation(false);
+    setPatientCreationError("");
 
     const demographics = selectedDocument.demographics ?? emptyNewPatientInput();
     let { firstName, lastName } = demographics;
@@ -481,6 +488,7 @@ export function DocumentWorkspace({
   }
 
   function updateNewPatientField(field: keyof NewPatientInput, value: string) {
+    setPatientCreationError("");
     setNewPatientForm((current) => ({ ...current, [field]: value }));
   }
 
@@ -503,10 +511,10 @@ export function DocumentWorkspace({
   }
 
   async function handleCreatePatient() {
-    const firstName = (newPatientForm.firstName ?? "").trim();
-    const lastName = (newPatientForm.lastName ?? "").trim();
-    const dateOfBirth = (newPatientForm.dateOfBirth ?? "").trim();
-    if (!firstName || !lastName || !dateOfBirth || !selectedDocument) return;
+    if (isCreatingPatient || !selectedDocument) return;
+    setShowPatientValidation(true);
+    setPatientCreationError("");
+    if (Object.keys(validateNewPatientInput(newPatientForm)).length) return;
 
     setIsCreatingPatient(true);
     try {
@@ -530,9 +538,7 @@ export function DocumentWorkspace({
       setNewPatientForm(emptyNewPatientInput());
       setRightPanelMode("document-info");
     } catch (error) {
-      showNotice(
-        error instanceof Error ? error.message : "Unable to create the patient",
-      );
+      setPatientCreationError(getPatientCreationErrorMessage(error));
     } finally {
       setIsCreatingPatient(false);
     }
@@ -1900,6 +1906,7 @@ export function DocumentWorkspace({
 
                   <Divider />
 
+                  {patientCreationError && <Alert severity="error">{patientCreationError}</Alert>}
                   <Stack spacing={2.5}>
                     <Stack spacing={1.5}>
                       <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
@@ -1923,6 +1930,8 @@ export function DocumentWorkspace({
                           autoFocus
                           label="First Name"
                           value={newPatientForm.firstName}
+                          error={Boolean(patientFormErrors.firstName)}
+                          helperText={patientFormErrors.firstName}
                           onChange={(event) => updateNewPatientField("firstName", event.target.value)}
                           required
                         />
@@ -1930,6 +1939,8 @@ export function DocumentWorkspace({
                           size="small"
                           label="Last Name"
                           value={newPatientForm.lastName}
+                          error={Boolean(patientFormErrors.lastName)}
+                          helperText={patientFormErrors.lastName}
                           onChange={(event) => updateNewPatientField("lastName", event.target.value)}
                           required
                         />
@@ -1950,6 +1961,8 @@ export function DocumentWorkspace({
                           label="Date of Birth"
                           type="date"
                           value={newPatientForm.dateOfBirth}
+                          error={Boolean(patientFormErrors.dateOfBirth)}
+                          helperText={patientFormErrors.dateOfBirth}
                           onChange={(event) => updateNewPatientField("dateOfBirth", event.target.value)}
                           slotProps={{ inputLabel: { shrink: true } }}
                           required
@@ -2133,12 +2146,7 @@ export function DocumentWorkspace({
                       <Button
                         onClick={handleCreatePatient}
                         variant="contained"
-                        disabled={
-                          !(newPatientForm.firstName ?? "").trim() ||
-                          !(newPatientForm.lastName ?? "").trim() ||
-                          !(newPatientForm.dateOfBirth ?? "").trim() ||
-                          isCreatingPatient
-                        }
+                        disabled={isCreatingPatient}
                       >
                         {isCreatingPatient ? "Creating..." : "Create New Patient"}
                       </Button>

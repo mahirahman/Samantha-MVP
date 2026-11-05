@@ -242,7 +242,40 @@ export function emptyNewPatientInput(): NewPatientInput {
   };
 }
 
+export function validateNewPatientInput(input: NewPatientInput): Partial<Record<keyof NewPatientInput, string>> {
+  const errors: Partial<Record<keyof NewPatientInput, string>> = {};
+  if (!input.firstName?.trim()) errors.firstName = "First name is required.";
+  if (!input.lastName?.trim()) errors.lastName = "Last name is required.";
+  const dob = input.dateOfBirth?.trim();
+  if (!dob) errors.dateOfBirth = "Date of birth is required.";
+  else {
+    const parsed = new Date(`${dob}T00:00:00Z`);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dob) || Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== dob) {
+      errors.dateOfBirth = "Enter a valid date of birth.";
+    }
+  }
+  return errors;
+}
+
+export function getPatientCreationErrorMessage(error: unknown): string {
+  const record = typeof error === "object" && error !== null ? error as { code?: string; message?: string } : {};
+  if (record.code === "23505") return "A patient with this identifier already exists. Check the existing patient record.";
+  if (record.code === "42501") return "You do not have permission to create patients. Contact your administrator.";
+  if (record.code === "PGRST301" || record.code === "PGRST302") return "Your session has expired. Sign in again before creating a patient.";
+  if (record.code === "22007" || record.code === "22008") return "Enter a valid date of birth.";
+  if (record.code === "23502") {
+    const field = record.message?.match(/column "([^"]+)"/)?.[1];
+    const labels: Record<string, string> = { date_of_birth: "Date of birth", full_name: "Patient name", first_name: "First name", last_name: "Last name" };
+    return field && labels[field] ? `${labels[field]} is required.` : "A required patient field is missing. Check the patient details.";
+  }
+  if (/failed to fetch|fetch failed|network|load failed/i.test(record.message || "")) return "Could not connect to the database. Check your connection and try again.";
+  return typeof record.message === "string" && record.message.trim()
+    ? record.message : "Could not create the patient. Please try again or contact your administrator.";
+}
+
 export async function createPatient(input: NewPatientInput): Promise<PatientRecord> {
+  const errors = validateNewPatientInput(input);
+  if (Object.keys(errors).length) throw new Error(Object.values(errors).join(" "));
   const firstName = input.firstName.trim();
   const lastName = input.lastName.trim();
   const middleName = input.middleName.trim();
@@ -252,7 +285,7 @@ export async function createPatient(input: NewPatientInput): Promise<PatientReco
     .from("patients")
     .insert({
       full_name: fullName,
-      date_of_birth: input.dateOfBirth,
+      date_of_birth: input.dateOfBirth.trim(),
       title: input.title.trim() || null,
       first_name: firstName || null,
       last_name: lastName || null,
@@ -283,7 +316,7 @@ export async function createPatient(input: NewPatientInput): Promise<PatientReco
     .select("id, full_name, date_of_birth")
     .single();
 
-  if (error) throw error;
+  if (error) throw new Error(getPatientCreationErrorMessage(error));
 
   return toPatientRecord(data as PatientRow);
 }
