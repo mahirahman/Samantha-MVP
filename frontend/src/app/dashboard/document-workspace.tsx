@@ -67,7 +67,8 @@ import {
   saveImportFolderName,
   type ImportDirectoryHandle,
 } from "@/lib/import-folder";
-import { processDocumentFile, type DocumentHighlight } from "@/lib/document-processing";
+import { listWorkspaceDocuments, saveWorkspaceDocument, deleteWorkspaceDocumentsFromDb, type DocumentItem as StoredDocumentItem } from "@/lib/documents";
+import { processDocumentFile } from "@/lib/document-processing";
 import { InteractiveDocumentViewer } from "./interactive-document-viewer";
 import {
   createPatient,
@@ -130,33 +131,10 @@ const doctorReviewCategories = new Set<string>([
   "Referral letter",
 ]);
 
-interface DocumentItem {
-  id: string;
-  name: string;
-  status: DocumentStatus;
-  inbox: string;
-  patient: string;
-  patientId?: string;
-  dateOfBirth: string;
-  patientVerified: boolean;
-  matchedIdentifierCount: number;
+type DocumentItem = StoredDocumentItem & {
   demographics: NewPatientInput;
-  fileSize: number;
   fileLastModified: number;
-  reportDate: string;
-  subject: string;
-  contact: string;
-  storeIn: StoreLocation;
-  assignedUser: string;
-  doctorId?: string;
-  userVerified: boolean;
-  category: string;
-  ocrCharacterCount?: number;
-  processingError?: string;
-  mimeType?: string;
-  previewUrl?: string;
-  highlights?: DocumentHighlight[];
-}
+};
 
 interface DocumentWorkspaceProps {
   email: string;
@@ -209,6 +187,10 @@ export function DocumentWorkspace({
   onSignOut,
 }: DocumentWorkspaceProps) {
   const [documents, setDocuments] = useState<DocumentItem[]>([]);
+  const [loadedUserId, setLoadedUserId] = useState<string | null>(null);
+  const documentsLoaded = loadedUserId === userId;
+  const persistedDocuments = useRef(new Map<string, DocumentItem>());
+  const persistenceQueue = useRef<Promise<void>>(Promise.resolve());
   const [folderFiles, setFolderFiles] = useState<File[]>([]);
   const [folderHandle, setFolderHandle] = useState<ImportDirectoryHandle | null>(null);
   const [folderName, setFolderName] = useState("");
@@ -244,6 +226,39 @@ export function DocumentWorkspace({
   const uploadInput = useRef<HTMLInputElement>(null);
   const folderInput = useRef<HTMLInputElement>(null);
   const previewUrls = useRef(new Set<string>());
+
+  useEffect(() => {
+    let active = true;
+    void listWorkspaceDocuments(userId).then((records) => {
+      if (!active) return;
+      const loaded = records.map((record) => ({
+        ...record,
+        demographics: record.demographics ?? emptyNewPatientInput(),
+        fileLastModified: record.fileLastModified ?? 0,
+      }));
+      persistedDocuments.current = new Map(loaded.map((doc) => [doc.id, doc]));
+      setDocuments(loaded);
+      setLoadedUserId(userId);
+    }).catch(() => {
+      if (active) setNotice("Could not load workspace documents. Refresh to retry.");
+    });
+    return () => { active = false; };
+  }, [userId]);
+
+  useEffect(() => {
+    if (!documentsLoaded) return;
+    const previous = persistedDocuments.current;
+    const next = new Map(documents.map((doc) => [doc.id, doc]));
+    const changed = documents.filter((doc) => previous.get(doc.id) !== doc);
+    const removed = [...previous.keys()].filter((id) => !next.has(id));
+    persistedDocuments.current = next;
+    persistenceQueue.current = persistenceQueue.current.then(async () => {
+      for (const doc of changed) await saveWorkspaceDocument(doc, userId);
+      if (removed.length) await deleteWorkspaceDocumentsFromDb(removed, userId);
+    }).catch(() => {
+      setNotice("Could not save workspace changes to the database. Please retry before refreshing.");
+    });
+  }, [documents, documentsLoaded, userId]);
 
   useEffect(() => {
     let isActive = true;
@@ -335,9 +350,6 @@ export function DocumentWorkspace({
     const s = getDocumentStatus(document);
     return s === "check" || s === "verified";
   });
-  const pendingQueueDocuments = queueDocuments.filter(
-    (document) => getDocumentStatus(document) === "check",
-  );
   const importedDocuments = documents.filter(
     (document) => getDocumentStatus(document) === "imported",
   );
@@ -386,7 +398,7 @@ export function DocumentWorkspace({
   }
 
   function createDocumentItems(files: File[]): DocumentItem[] {
-    const addedDocuments = files.map((file, index): DocumentItem => {
+    const addedDocuments = files.map((file): DocumentItem => {
       let previewUrl: string | undefined;
       let status: DocumentStatus = "check";
 
@@ -401,7 +413,7 @@ export function DocumentWorkspace({
       }
 
       return {
-        id: `file-${Date.now()}-${index}-${Math.random().toString(36).slice(2)}`,
+        id: crypto.randomUUID(),
         name: file.name,
         status,
         inbox: "Doctor's Inbox",
@@ -524,7 +536,7 @@ export function DocumentWorkspace({
   async function handleUpload(event: ChangeEvent<HTMLInputElement>) {
     const allFiles = Array.from(event.target.files ?? []);
     event.target.value = "";
-    if (allFiles.length === 0) return;
+    if (allFiles.length === 0 || !documentsLoaded || isImporting) return;
 
     // Reject any files that already exist in documents (queue, imported, or errors) or duplicates in current batch
     const existingNames = new Set(documents.map((d) => d.name.toLowerCase().trim()));
@@ -582,6 +594,8 @@ export function DocumentWorkspace({
         setProcessingProgress((current) =>
           current ? { ...current, currentFileName: document.name } : current,
         );
+        // Reserve the filename in the database before OCR/Gemini starts.
+        await saveWorkspaceDocument({ ...document, status: "error", processingError: "Import interrupted before processing completed. Reprocess to retry." }, userId, files[index]);
         let processedDocument = document;
 
         if (document.status !== "error") {
@@ -602,11 +616,16 @@ export function DocumentWorkspace({
           failedCount += 1;
         }
 
+        await saveWorkspaceDocument(processedDocument, userId);
         processedDocuments.push(processedDocument);
         setProcessingProgress((current) =>
           current ? { ...current, completed: current.completed + 1 } : current,
         );
       }
+    } catch (error) {
+      setDocuments((current) => [...processedDocuments, ...current]);
+      showNotice(error instanceof Error ? error.message : "Import could not be saved. Please refresh before retrying.");
+      return;
     } finally {
       setIsImporting(false);
       setProcessingProgress(null);
@@ -620,6 +639,16 @@ export function DocumentWorkspace({
     showNotice(
       `${successfulCount} file${successfulCount === 1 ? "" : "s"} processed${failedCount ? `; ${failedCount} failed and moved to Errors` : " and added to Queue"}`,
     );
+  }
+
+  function getNewFolderFiles(files: File[]): File[] {
+    const seen = new Set(documents.map((doc) => doc.name.toLowerCase().trim()));
+    return files.filter((file) => {
+      const name = file.name.toLowerCase().trim();
+      if (seen.has(name)) return false;
+      seen.add(name);
+      return true;
+    });
   }
 
   async function handleChooseFolder() {
@@ -642,7 +671,7 @@ export function DocumentWorkspace({
       setIsCountingFolder(true);
       try {
         const files = await getImportFolderFiles(handle);
-        setBulkImportCount(pendingQueueDocuments.length + files.length);
+        setBulkImportCount(getNewFolderFiles(files).length);
       } catch {
         setBulkImportCount(null);
       } finally {
@@ -666,8 +695,7 @@ export function DocumentWorkspace({
       return;
     }
 
-    const existingNames = new Set(documents.map((d) => d.name.toLowerCase().trim()));
-    const newFiles = files.filter((f) => !existingNames.has(f.name.toLowerCase().trim()));
+    const newFiles = getNewFolderFiles(files);
     const skippedCount = files.length - newFiles.length;
 
     const selectedFolder = files[0].webkitRelativePath.split("/")[0] || "Selected folder";
@@ -675,9 +703,9 @@ export function DocumentWorkspace({
       await saveImportFolderName(userId, selectedFolder);
       await clearLocalImportFolderHandle(userId);
       setFolderHandle(null);
-      setFolderFiles(newFiles);
+      setFolderFiles(files);
       setFolderName(selectedFolder);
-      setBulkImportCount(pendingQueueDocuments.length + newFiles.length);
+      setBulkImportCount(newFiles.length);
       setSettingsOpen(false);
       showNotice(
         skippedCount > 0
@@ -763,13 +791,12 @@ export function DocumentWorkspace({
 
   async function handleOpenBulkImport() {
     setImportDialogOpen(true);
-    const existingNames = new Set(documents.map((d) => d.name.toLowerCase().trim()));
-    const newFolderFiles = folderFiles.filter((f) => !existingNames.has(f.name.toLowerCase().trim()));
+    const newFolderFiles = getNewFolderFiles(folderFiles);
     setBulkImportCount(
       (folderName && !folderHandle && folderFiles.length === 0) ||
         (folderHandle && folderFiles.length === 0)
         ? null
-        : pendingQueueDocuments.length + newFolderFiles.length,
+        : newFolderFiles.length,
     );
 
     if (!folderHandle) return;
@@ -778,8 +805,8 @@ export function DocumentWorkspace({
     try {
       if ((await folderHandle.queryPermission({ mode: "read" })) === "granted") {
         const files = await getImportFolderFiles(folderHandle);
-        const newFiles = files.filter((f) => !existingNames.has(f.name.toLowerCase().trim()));
-        setBulkImportCount(pendingQueueDocuments.length + newFiles.length);
+        const newFiles = getNewFolderFiles(files);
+        setBulkImportCount(newFiles.length);
       } else {
         setBulkImportCount(null);
       }
@@ -804,9 +831,8 @@ export function DocumentWorkspace({
       }
 
       const files = await getImportFolderFiles(folderHandle);
-      const existingNames = new Set(documents.map((d) => d.name.toLowerCase().trim()));
-      const newFiles = files.filter((f) => !existingNames.has(f.name.toLowerCase().trim()));
-      setBulkImportCount(pendingQueueDocuments.length + newFiles.length);
+      const newFiles = getNewFolderFiles(files);
+      setBulkImportCount(newFiles.length);
     } catch (error) {
       showNotice(
         error instanceof Error ? error.message : "Unable to read the selected folder",
@@ -818,7 +844,7 @@ export function DocumentWorkspace({
   }
 
   async function handleConfirmBulkImport() {
-    if (isImporting) return;
+    if (isImporting || !documentsLoaded) return;
     if (folderName && !folderHandle && folderFiles.length === 0) {
       setImportDialogOpen(false);
       void handleChooseFolder();
@@ -864,37 +890,10 @@ export function DocumentWorkspace({
       }
 
       setProcessingProgress({
-        total: pendingQueueDocuments.length + newFilesToProcess.length,
+        total: newFilesToProcess.length,
         completed: 0,
         currentFileName: "",
       });
-
-      const queueUpdates = new Map<string, Partial<DocumentItem>>();
-      for (const document of pendingQueueDocuments) {
-        setProcessingProgress((current) =>
-          current ? { ...current, currentFileName: document.name } : current,
-        );
-        try {
-          if (!document.previewUrl) throw new Error("The uploaded file is unavailable");
-          const fileResponse = await fetch(document.previewUrl);
-          if (!fileResponse.ok) throw new Error("Could not read the uploaded file");
-          const blob = await fileResponse.blob();
-          const file = new File([blob], document.name, {
-            type: document.mimeType || blob.type,
-            lastModified: document.fileLastModified,
-          });
-          const processed = await processDocumentFile(file);
-          queueUpdates.set(document.id, await mapExtraction(document, processed));
-        } catch (error) {
-          queueUpdates.set(document.id, {
-            status: "error",
-            processingError: error instanceof Error ? error.message : "Document processing failed",
-          });
-        }
-        setProcessingProgress((current) =>
-          current ? { ...current, completed: current.completed + 1 } : current,
-        );
-      }
 
       const folderDocuments: DocumentItem[] = [];
       for (const file of newFilesToProcess) {
@@ -902,7 +901,9 @@ export function DocumentWorkspace({
           current ? { ...current, currentFileName: file.name } : current,
         );
         const [document] = createDocumentItems([file]);
+        await saveWorkspaceDocument({ ...document, status: "error", processingError: "Import interrupted before processing completed. Reprocess to retry." }, userId, file);
         if (document.status === "error") {
+          await saveWorkspaceDocument(document, userId);
           folderDocuments.push(document);
           setProcessingProgress((current) =>
             current ? { ...current, completed: current.completed + 1 } : current,
@@ -920,6 +921,7 @@ export function DocumentWorkspace({
             processingError: error instanceof Error ? error.message : "Document processing failed",
           });
         }
+        await saveWorkspaceDocument(folderDocuments[folderDocuments.length - 1], userId);
         setProcessingProgress((current) =>
           current ? { ...current, completed: current.completed + 1 } : current,
         );
@@ -936,15 +938,10 @@ export function DocumentWorkspace({
         });
       }
 
-      const failedCount = [
-        ...folderDocuments.filter((document) => document.status === "error"),
-        ...Array.from(queueUpdates.values()).filter((updates) => updates.status === "error"),
-      ].length;
-      const successfulCount =
-        folderDocuments.filter((document) => document.status !== "error").length +
-        Array.from(queueUpdates.values()).filter((updates) => updates.status !== "error").length;
+      const failedCount = folderDocuments.filter((document) => document.status === "error").length;
+      const successfulCount = folderDocuments.length - failedCount;
 
-      if (pendingQueueDocuments.length === 0 && folderDocuments.length === 0) {
+      if (folderDocuments.length === 0) {
         if (duplicateCount > 0) {
           showNotice(
             `All ${duplicateCount} documents in ${folderName} already exist in the workspace and were skipped.`,
@@ -955,12 +952,10 @@ export function DocumentWorkspace({
         return;
       }
 
-      // Both the queue and folder documents are only committed to state once
-      // every file has finished processing, so the Queue/Errors tables never
-      // show partially-processed rows.
+      // Reveal processed folder documents together after the batch completes.
       setDocuments((current) => [
         ...folderDocuments,
-        ...current.map((document) => ({ ...document, ...queueUpdates.get(document.id) })),
+        ...current,
       ]);
       setActiveTab(failedCount > 0 ? "errors" : "queue");
       setSelectedIds(new Set());
@@ -972,6 +967,8 @@ export function DocumentWorkspace({
       showNotice(
         `${successfulCount} file${successfulCount === 1 ? "" : "s"} added to Queue${failedCount ? `; ${failedCount} failed and moved to Errors` : ""}${duplicateNotice}${folderDocuments.length && failedCount === 0 ? ` from ${folderName}` : ""}`,
       );
+    } catch (error) {
+      showNotice(error instanceof Error ? error.message : "Import could not be saved. Please refresh before retrying.");
     } finally {
       setIsImporting(false);
       setProcessingProgress(null);
@@ -1362,6 +1359,7 @@ export function DocumentWorkspace({
             <Button
               variant="contained"
               startIcon={<CloudUploadOutlinedIcon />}
+              disabled={!documentsLoaded || isImporting}
               onClick={() => uploadInput.current?.click()}
               sx={{ whiteSpace: "nowrap" }}
             >
@@ -1380,7 +1378,7 @@ export function DocumentWorkspace({
               color="info"
               startIcon={<AutoAwesomeIcon />}
               onClick={handleOpenBulkImport}
-              disabled={(pendingQueueDocuments.length === 0 && !folderName && !folderHandle && folderFiles.length === 0) || isImporting}
+              disabled={!documentsLoaded || (!folderName && !folderHandle && folderFiles.length === 0) || isImporting}
               sx={{ whiteSpace: "nowrap", flex: 1 }}
             >
               {isImporting ? <CircularProgress size={20} color="inherit" /> : "Auto Bulk Import"}
@@ -2313,7 +2311,8 @@ export function DocumentWorkspace({
                       <RadioGroup
                         row
                         value={selectedDocument.inbox || "Doctor's Inbox"}
-                        onChange={(_, inbox) => {
+                        onChange={(_, value) => {
+                          const inbox = value === "Patient's File" ? "Patient's File" : "Doctor's Inbox";
                           const isDoctorRequired = inbox !== "Patient's File";
                           const assignedUser = inbox === "Patient's File" ? "" : selectedDocument.assignedUser;
                           const currentDoctors =
@@ -2757,6 +2756,7 @@ export function DocumentWorkspace({
               <Button
                 variant="contained"
                 startIcon={<CloudUploadOutlinedIcon />}
+                disabled={!documentsLoaded || isImporting}
                 onClick={() => uploadInput.current?.click()}
                 sx={{ mt: 1 }}
               >

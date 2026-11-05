@@ -142,34 +142,27 @@ function mapRowToDocumentItem(row: DocumentRow): DocumentItem {
 
 /**
  * Loads all workspace documents from Supabase.
- * Uses localStorage cache as an immediate fallback or local layer.
+ * Uses the database as the authority and cache only for preview metadata.
  */
 export async function listWorkspaceDocuments(userId?: string): Promise<DocumentItem[]> {
   const cached = loadCachedDocuments(userId);
 
   try {
     const client = getSupabaseClient();
-    const query = client
-      .from("documents")
-      .select("*")
-      .order("created_at", { ascending: false });
-
-    if (userId) {
-      // Allow fetching documents uploaded by this user, or shared documents
-      query.or(`uploaded_by.eq.${userId},uploaded_by.is.null`);
+    const rows: DocumentRow[] = [];
+    // Supabase limits each response; duplicate checks must include every page.
+    for (let offset = 0; ; offset += 1000) {
+      let query = client.from("documents").select("*")
+        .neq("status", "deleted")
+        .order("created_at", { ascending: false }).order("id")
+        .range(offset, offset + 999);
+      if (userId) query = query.or(`uploaded_by.eq.${userId},uploaded_by.is.null`);
+      const { data, error } = await query;
+      if (error) throw new Error(`Could not load workspace: ${error.message}`);
+      rows.push(...((data || []) as DocumentRow[]));
+      if (!data || data.length < 1000) break;
     }
-
-    const { data, error } = await query;
-    if (error) {
-      console.warn("Could not fetch documents from Supabase:", error.message);
-      return cached;
-    }
-
-    if (!data || data.length === 0) {
-      return cached;
-    }
-
-    const dbDocs = (data as DocumentRow[]).map(mapRowToDocumentItem);
+    const dbDocs = rows.map(mapRowToDocumentItem);
 
     // Merge: Preserve any memory previewUrls from current session cache if present
     const cachedMap = new Map(cached.map((d) => [d.id, d]));
@@ -185,7 +178,7 @@ export async function listWorkspaceDocuments(userId?: string): Promise<DocumentI
     return merged;
   } catch (err) {
     console.warn("listWorkspaceDocuments error:", err);
-    return cached;
+    throw err;
   }
 }
 
@@ -245,10 +238,9 @@ export async function saveWorkspaceDocument(
       id: doc.id,
       file_name: doc.name,
       file_size: doc.fileSize,
-      file_last_modified: doc.fileLastModified || Date.now(),
+      file_last_modified: doc.fileLastModified ?? 0,
       mime_type: doc.mimeType || null,
       status: doc.status,
-      category: doc.category,
       document_category: doc.category,
       subject: doc.subject,
       source_contact: doc.contact,
@@ -280,7 +272,7 @@ export async function saveWorkspaceDocument(
       .upsert(rowPayload, { onConflict: "id" });
 
     if (error) {
-      console.warn("Could not upsert document to Supabase:", error.message);
+      throw new Error(`Could not save document: ${error.message}`);
     }
 
     // Sync to document_extractions table if patient or doctor exists
@@ -291,7 +283,7 @@ export async function saveWorkspaceDocument(
       void syncFiling(doc, userId, client);
     }
   } catch (err) {
-    console.warn("saveWorkspaceDocument error:", err);
+    throw err;
   }
 }
 
@@ -330,15 +322,14 @@ export async function updateWorkspaceDocumentInDb(
 ): Promise<void> {
   // Update local cache immediately
   const current = loadCachedDocuments(userId);
-  let updatedDoc: DocumentItem | null = null;
   const nextCache = current.map((d) => {
     if (d.id === docId) {
-      updatedDoc = { ...d, ...updates };
-      return updatedDoc;
+      return { ...d, ...updates };
     }
     return d;
   });
   setCachedDocuments(nextCache, userId);
+  const updatedDoc = nextCache.find((doc) => doc.id === docId);
 
   try {
     const client = getSupabaseClient();
@@ -358,7 +349,6 @@ export async function updateWorkspaceDocumentInDb(
     if (updates.inbox !== undefined) rowUpdates.inbox = updates.inbox;
     if (updates.storeIn !== undefined) rowUpdates.store_in = updates.storeIn;
     if (updates.category !== undefined) {
-      rowUpdates.category = updates.category;
       rowUpdates.document_category = updates.category;
     }
     if (updates.subject !== undefined) rowUpdates.subject = updates.subject;
@@ -400,12 +390,12 @@ export async function deleteWorkspaceDocumentsFromDb(
 
   try {
     const client = getSupabaseClient();
-    const { error } = await client.from("documents").delete().in("id", docIds);
+    const { error } = await client.from("documents").update({ status: "deleted" }).in("id", docIds);
     if (error) {
-      console.warn("Could not delete documents from Supabase:", error.message);
+      throw new Error(`Could not remove documents: ${error.message}`);
     }
   } catch (err) {
-    console.warn("deleteWorkspaceDocumentsFromDb error:", err);
+    throw err;
   }
 }
 
