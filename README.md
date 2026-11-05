@@ -29,6 +29,12 @@ npm run start:dev
 
 The frontend is available at `http://localhost:3000`; the API health endpoint is `http://localhost:3001/api/health`.
 
+## AI document processing
+
+Auto Bulk Import sends each pending file to the authenticated `POST /api/documents/process` endpoint as multipart form data. The backend verifies the Supabase bearer token, runs Azure Document Intelligence `prebuilt-read`, then sends the OCR text to Gemini for structured filing metadata. OCR text and API credentials are not logged. The endpoint currently returns extraction results to the frontend; it does not yet upload the file or save extraction rows to Supabase Storage/database.
+
+Copy `backend/.env.example` to `backend/.env` and set `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, `AZURE_DOCUMENT_INTELLIGENCE_KEY`, and `GOOGLE_API_KEY`; `GOOGLE_GENAI_MODEL` defaults to `gemini-3.5-flash-lite`. Keep these keys out of source control; configure them as ECS Secrets Manager/Parameter Store values for deployment. The published Azure JavaScript SDK is `@azure/ai-form-recognizer` (the requested `@azure/ai-document-intelligence` package is not available in the configured npm registry); it is the official SDK for Azure Document Intelligence. The supplied Google API key uses the Gemini Developer API. To use Vertex AI instead, set `GOOGLE_GENAI_USE_VERTEXAI=true` and configure Google Cloud project/location plus Application Default Credentials; an API key alone does not authenticate Vertex AI.
+
 ## Supabase authentication
 
 In Supabase, open **Authentication → URL Configuration** and set the Site URL to `http://localhost:3000`. Add `http://localhost:3000/**` to the Redirect URLs list. For deployment, add `https://YOUR_ACTUAL_VERCEL_DOMAIN/**` and use the exact Vercel domain; these allowlisted URLs are needed for email confirmation and password recovery redirects.

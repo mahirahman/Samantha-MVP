@@ -17,6 +17,7 @@ import DialogContent from "@mui/material/DialogContent";
 import DialogTitle from "@mui/material/DialogTitle";
 import FormControlLabel from "@mui/material/FormControlLabel";
 import IconButton from "@mui/material/IconButton";
+import LinearProgress from "@mui/material/LinearProgress";
 import Menu from "@mui/material/Menu";
 import MenuItem from "@mui/material/MenuItem";
 import Paper from "@mui/material/Paper";
@@ -63,6 +64,7 @@ import {
   saveImportFolderName,
   type ImportDirectoryHandle,
 } from "@/lib/import-folder";
+import { processDocumentFile } from "@/lib/document-processing";
 
 type DocumentStatus = "check" | "verified" | "error" | "imported";
 type QueueTab = "queue" | "imported" | "errors";
@@ -123,6 +125,8 @@ interface DocumentItem {
   storeIn: StoreLocation;
   assignedUser: string;
   category: string;
+  ocrCharacterCount?: number;
+  processingError?: string;
   mimeType?: string;
   previewUrl?: string;
 }
@@ -132,6 +136,12 @@ interface DocumentWorkspaceProps {
   userId: string;
   errorMessage: string;
   onSignOut: () => void;
+}
+
+interface ProcessingProgress {
+  total: number;
+  completed: number;
+  currentFileName: string;
 }
 
 const statusInfo: Record<
@@ -158,6 +168,9 @@ export function DocumentWorkspace({
   const [newPatientDialogOpen, setNewPatientDialogOpen] = useState(false);
   const [newPatientName, setNewPatientName] = useState("");
   const [isImporting, setIsImporting] = useState(false);
+  const [processingProgress, setProcessingProgress] = useState<ProcessingProgress | null>(
+    null,
+  );
   const [activeTab, setActiveTab] = useState<QueueTab>("queue");
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [selectedDocumentId, setSelectedDocumentId] = useState<string | null>(null);
@@ -203,6 +216,9 @@ export function DocumentWorkspace({
 
   const queueDocuments = documents.filter(
     (document) => document.status === "check" || document.status === "verified",
+  );
+  const pendingQueueDocuments = queueDocuments.filter(
+    (document) => document.status === "check",
   );
   const importedDocuments = documents.filter(
     (document) => document.status === "imported",
@@ -305,22 +321,63 @@ export function DocumentWorkspace({
     setNewPatientDialogOpen(false);
   }
 
-  function handleUpload(event: ChangeEvent<HTMLInputElement>) {
+  async function handleUpload(event: ChangeEvent<HTMLInputElement>) {
     const files = Array.from(event.target.files ?? []);
+    event.target.value = "";
     if (files.length === 0) return;
 
     const addedDocuments = createDocumentItems(files);
-
-    setDocuments((current) => [...addedDocuments, ...current]);
-    const failedCount = addedDocuments.filter((document) => document.status === "error").length;
-    setActiveTab(failedCount > 0 ? "errors" : "queue");
     setSelectedDocumentId(null);
+
+    setIsImporting(true);
+    setProcessingProgress({ total: addedDocuments.length, completed: 0, currentFileName: "" });
+    let failedCount = 0;
+    let successfulCount = 0;
+    const processedDocuments: DocumentItem[] = [];
+
+    try {
+      for (const [index, document] of addedDocuments.entries()) {
+        setProcessingProgress((current) =>
+          current ? { ...current, currentFileName: document.name } : current,
+        );
+        let processedDocument = document;
+
+        if (document.status !== "error") {
+          try {
+            const result = await processDocumentFile(files[index]);
+            processedDocument = mapExtraction(document, result);
+            successfulCount += 1;
+          } catch (error) {
+            processedDocument = {
+              ...document,
+              status: "error",
+              processingError:
+                error instanceof Error ? error.message : "Document processing failed",
+            };
+            failedCount += 1;
+          }
+        } else {
+          failedCount += 1;
+        }
+
+        processedDocuments.push(processedDocument);
+        setProcessingProgress((current) =>
+          current ? { ...current, completed: current.completed + 1 } : current,
+        );
+      }
+    } finally {
+      setIsImporting(false);
+      setProcessingProgress(null);
+    }
+
+    // Documents only enter the Queue/Errors tables once every file has
+    // finished OCR + extraction, so the modal's progress bar is the sole
+    // indicator while processing is in flight.
+    setDocuments((current) => [...processedDocuments, ...current]);
+    setActiveTab(failedCount > 0 ? "errors" : "queue");
     showNotice(
-      failedCount > 0
-        ? `${failedCount} file${failedCount === 1 ? "" : "s"} could not be added and moved to Errors`
-        : `${files.length} file${files.length === 1 ? "" : "s"} added to Queue`,
+      `${successfulCount} file${successfulCount === 1 ? "" : "s"} processed${failedCount ? `; ${failedCount} failed and moved to Errors` : " and added to Queue"}`,
     );
-    event.target.value = "";
   }
 
   async function handleChooseFolder() {
@@ -343,7 +400,7 @@ export function DocumentWorkspace({
       setIsCountingFolder(true);
       try {
         const files = await getImportFolderFiles(handle);
-        setBulkImportCount(queueDocuments.length + files.length);
+        setBulkImportCount(pendingQueueDocuments.length + files.length);
       } catch {
         setBulkImportCount(null);
       } finally {
@@ -374,7 +431,7 @@ export function DocumentWorkspace({
       setFolderHandle(null);
       setFolderFiles(files);
       setFolderName(selectedFolder);
-      setBulkImportCount(queueDocuments.length + files.length);
+      setBulkImportCount(pendingQueueDocuments.length + files.length);
       setSettingsOpen(false);
       showNotice(`${selectedFolder} saved to your account`);
     } catch (error) {
@@ -460,7 +517,7 @@ export function DocumentWorkspace({
       (folderName && !folderHandle && folderFiles.length === 0) ||
         (folderHandle && folderFiles.length === 0)
         ? null
-        : queueDocuments.length + folderFiles.length,
+        : pendingQueueDocuments.length + folderFiles.length,
     );
 
     if (!folderHandle) return;
@@ -469,7 +526,7 @@ export function DocumentWorkspace({
     try {
       if (await folderHandle.queryPermission({ mode: "read" }) === "granted") {
         const files = await getImportFolderFiles(folderHandle);
-        setBulkImportCount(queueDocuments.length + files.length);
+        setBulkImportCount(pendingQueueDocuments.length + files.length);
       } else {
         setBulkImportCount(null);
       }
@@ -494,7 +551,7 @@ export function DocumentWorkspace({
       }
 
       const files = await getImportFolderFiles(folderHandle);
-      setBulkImportCount(queueDocuments.length + files.length);
+      setBulkImportCount(pendingQueueDocuments.length + files.length);
     } catch (error) {
       showNotice(
         error instanceof Error ? error.message : "Unable to read the selected folder",
@@ -514,85 +571,157 @@ export function DocumentWorkspace({
     }
     setIsImporting(true);
     setImportDialogOpen(false);
+    setProcessingProgress({ total: 0, completed: 0, currentFileName: "" });
 
-    const applyDestination = (document: DocumentItem): DocumentItem => ({
-      ...document,
-      inbox:
-        importDestination === "doctor-inbox"
-          ? "Doctor's Inbox"
-          : importDestination === "patient-file"
-            ? "Patient's File"
-            : document.inbox,
-    });
+    try {
+      let filesToProcess = folderFiles;
+      let folderReadError = "";
+      if (folderHandle) {
+        try {
+          let permission = await folderHandle.queryPermission({ mode: "read" });
+          if (permission !== "granted") {
+            permission = await folderHandle.requestPermission({ mode: "read" });
+          }
+          if (permission !== "granted") {
+            throw new Error("Folder access was not granted");
+          }
 
-    let folderDocuments: DocumentItem[] = [];
-    if (folderHandle) {
-      try {
-        let permission = await folderHandle.queryPermission({ mode: "read" });
-        if (permission !== "granted") {
-          permission = await folderHandle.requestPermission({ mode: "read" });
+          filesToProcess = await getImportFolderFiles(folderHandle);
+        } catch (error) {
+          folderReadError = error instanceof Error ? error.message : "Unable to read the selected folder";
         }
-        if (permission !== "granted") {
-          throw new Error("Folder access was not granted");
-        }
-
-        const files = await getImportFolderFiles(folderHandle);
-        folderDocuments = createDocumentItems(files).map((document) =>
-          document.status === "error"
-            ? document
-            : { ...applyDestination(document), status: "verified" as const },
-        );
-      } catch {
-        folderDocuments = [
-          {
-            id: `folder-error-${Date.now()}`,
-            name: `${folderName} (folder import failed)`,
-            status: "error",
-            inbox: "Doctor's Inbox",
-            patient: "Not Found",
-            fileSize: 0,
-            fileLastModified: Date.now(),
-            reportDate: new Date().toISOString().slice(0, 10),
-            subject: "",
-            contact: "",
-            storeIn: "Investigations",
-            assignedUser: "",
-            category: "",
-          },
-        ];
       }
-    } else if (folderFiles.length > 0) {
-      folderDocuments = createDocumentItems(folderFiles).map((document) =>
-        document.status === "error"
-          ? document
-          : { ...applyDestination(document), status: "verified" as const },
+
+      setProcessingProgress({
+        total: pendingQueueDocuments.length + filesToProcess.length,
+        completed: 0,
+        currentFileName: "",
+      });
+
+      const queueUpdates = new Map<string, Partial<DocumentItem>>();
+      for (const document of pendingQueueDocuments) {
+        setProcessingProgress((current) =>
+          current ? { ...current, currentFileName: document.name } : current,
+        );
+        try {
+          if (!document.previewUrl) throw new Error("The uploaded file is unavailable");
+          const fileResponse = await fetch(document.previewUrl);
+          if (!fileResponse.ok) throw new Error("Could not read the uploaded file");
+          const blob = await fileResponse.blob();
+          const file = new File([blob], document.name, {
+            type: document.mimeType || blob.type,
+            lastModified: document.fileLastModified,
+          });
+          const processed = await processDocumentFile(file);
+          queueUpdates.set(document.id, mapExtraction(document, processed));
+        } catch (error) {
+          queueUpdates.set(document.id, {
+            status: "error",
+            processingError: error instanceof Error ? error.message : "Document processing failed",
+          });
+        }
+        setProcessingProgress((current) =>
+          current ? { ...current, completed: current.completed + 1 } : current,
+        );
+      }
+
+      const folderDocuments: DocumentItem[] = [];
+      for (const file of filesToProcess) {
+        setProcessingProgress((current) =>
+          current ? { ...current, currentFileName: file.name } : current,
+        );
+        const [document] = createDocumentItems([file]);
+        if (document.status === "error") {
+          folderDocuments.push(document);
+          setProcessingProgress((current) =>
+            current ? { ...current, completed: current.completed + 1 } : current,
+          );
+          continue;
+        }
+
+        try {
+          const processed = await processDocumentFile(file);
+          folderDocuments.push(mapExtraction(document, processed));
+        } catch (error) {
+          folderDocuments.push({
+            ...document,
+            status: "error",
+            processingError: error instanceof Error ? error.message : "Document processing failed",
+          });
+        }
+        setProcessingProgress((current) =>
+          current ? { ...current, completed: current.completed + 1 } : current,
+        );
+      }
+
+      if (folderReadError) {
+        const [folderErrorDocument] = createDocumentItems([
+          new File([], `${folderName} (folder import failed)`),
+        ]);
+        folderDocuments.push({
+          ...folderErrorDocument,
+          status: "error",
+          processingError: folderReadError,
+        });
+      }
+
+      const failedCount = [
+        ...folderDocuments.filter((document) => document.status === "error"),
+        ...Array.from(queueUpdates.values()).filter((updates) => updates.status === "error"),
+      ].length;
+      const successfulCount =
+        folderDocuments.filter((document) => document.status === "verified").length +
+        Array.from(queueUpdates.values()).filter((updates) => updates.status === "verified").length;
+
+      if (pendingQueueDocuments.length === 0 && folderDocuments.length === 0) {
+        showNotice(folderHandle ? `No files found in ${folderName}` : "No new files to process");
+        return;
+      }
+
+      // Both the queue and folder documents are only committed to state once
+      // every file has finished processing, so the Queue/Errors tables never
+      // show partially-processed rows.
+      setDocuments((current) => [
+        ...folderDocuments,
+        ...current.map((document) => ({ ...document, ...queueUpdates.get(document.id) })),
+      ]);
+      setActiveTab(failedCount > 0 ? "errors" : "queue");
+      setSelectedIds(new Set());
+      setSelectedDocumentId(null);
+      showNotice(
+        `${successfulCount} file${successfulCount === 1 ? "" : "s"} added to Queue${failedCount ? `; ${failedCount} failed and moved to Errors` : ""}${folderDocuments.length && failedCount === 0 ? ` from ${folderName}` : ""}`,
       );
-    }
-
-    const failedCount = folderDocuments.filter((document) => document.status === "error").length;
-    const successfulCount = queueDocuments.length + folderDocuments.length - failedCount;
-
-    if (queueDocuments.length === 0 && folderDocuments.length === 0) {
-      showNotice(folderHandle ? `No files found in ${folderName}` : "No files to import");
+    } finally {
       setIsImporting(false);
-      return;
+      setProcessingProgress(null);
     }
+  }
 
-    setDocuments((current) => [
-      ...folderDocuments,
-      ...current.map((document) =>
-        document.status === "check"
-          ? { ...applyDestination(document), status: "verified" as const }
-          : document,
-      ),
-    ]);
-    setActiveTab(failedCount > 0 ? "errors" : "queue");
-    setSelectedIds(new Set());
-    setSelectedDocumentId(null);
-    setIsImporting(false);
-    showNotice(
-      `${successfulCount} file${successfulCount === 1 ? "" : "s"} added to Queue${failedCount ? `; ${failedCount} failed and moved to Errors` : ""}${folderDocuments.length && failedCount === 0 ? ` from ${folderName}` : ""}`,
-    );
+  function mapExtraction(
+    document: DocumentItem,
+    result: Awaited<ReturnType<typeof processDocumentFile>>,
+  ): DocumentItem {
+    const extraction = result.extraction;
+    const inbox = importDestination === "doctor-inbox"
+      ? "Doctor's Inbox"
+      : importDestination === "patient-file"
+        ? "Patient's File"
+        : extraction.inboxType || "Doctor's Inbox";
+
+    return {
+      ...document,
+      status: "verified",
+      patient: extraction.patientName,
+      reportDate: extraction.reportDate || document.reportDate,
+      subject: extraction.subject,
+      contact: extraction.sourceContact,
+      inbox,
+      storeIn: extraction.storeIn || document.storeIn,
+      assignedUser: extraction.gpDoctor,
+      category: extraction.category,
+      ocrCharacterCount: result.ocrCharacterCount,
+      processingError: undefined,
+    };
   }
 
   function handleClearQueue() {
@@ -730,7 +859,7 @@ export function DocumentWorkspace({
               color="info"
               startIcon={<AutoAwesomeIcon />}
               onClick={handleOpenBulkImport}
-              disabled={(queueDocuments.length === 0 && !folderName && !folderHandle && folderFiles.length === 0) || isImporting}
+              disabled={(pendingQueueDocuments.length === 0 && !folderName && !folderHandle && folderFiles.length === 0) || isImporting}
               sx={{ whiteSpace: "nowrap", flex: 1 }}
             >
               {isImporting ? <CircularProgress size={20} color="inherit" /> : "Auto Bulk Import"}
@@ -1261,9 +1390,6 @@ export function DocumentWorkspace({
                         />
                       </RadioGroup>
                     </Stack>
-                    <Typography variant="caption" color="text.secondary">
-                      Defaults to Doctor&apos;s Inbox. Change this when the document belongs in the patient&apos;s file.
-                    </Typography>
                   </Box>
 
                   <Autocomplete
@@ -1409,6 +1535,41 @@ export function DocumentWorkspace({
             Create patient
           </Button>
         </DialogActions>
+      </Dialog>
+
+      <Dialog
+        open={Boolean(processingProgress)}
+        maxWidth="xs"
+        fullWidth
+        disableEscapeKeyDown
+        slotProps={{ backdrop: { sx: { pointerEvents: "none" } } }}
+      >
+        <DialogTitle>Processing Documents</DialogTitle>
+        <DialogContent>
+          <Stack spacing={1.5} sx={{ pt: 0.5 }}>
+            <Typography variant="body2" color="text.secondary">
+              Running OCR and extraction before adding these documents to the
+              Queue. This may take a moment.
+            </Typography>
+            <LinearProgress
+              variant="determinate"
+              value={
+                processingProgress && processingProgress.total > 0
+                  ? (processingProgress.completed / processingProgress.total) * 100
+                  : 0
+              }
+            />
+            <Typography variant="caption" color="text.secondary" noWrap>
+              {processingProgress
+                ? `${processingProgress.completed} of ${processingProgress.total} processed${
+                    processingProgress.currentFileName
+                      ? ` — ${processingProgress.currentFileName}`
+                      : ""
+                  }`
+                : ""}
+            </Typography>
+          </Stack>
+        </DialogContent>
       </Dialog>
 
       <Snackbar
