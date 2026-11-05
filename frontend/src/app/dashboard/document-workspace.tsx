@@ -1460,7 +1460,7 @@ export function DocumentWorkspace({
               color="info"
               startIcon={<AutoAwesomeIcon />}
               onClick={handleOpenBulkImport}
-              disabled={!documentsLoaded || (!folderName && !folderHandle && folderFiles.length === 0) || isImporting || isFiling}
+              disabled={isImporting || isFiling}
               sx={{ whiteSpace: "nowrap", flex: 1 }}
             >
               {isImporting ? <CircularProgress size={20} color="inherit" /> : "Auto Bulk Import"}
