@@ -54,6 +54,7 @@ import MoreHorizIcon from "@mui/icons-material/MoreHoriz";
 import MoveToInboxIcon from "@mui/icons-material/MoveToInbox";
 import OpenInFullIcon from "@mui/icons-material/OpenInFull";
 import RefreshIcon from "@mui/icons-material/Refresh";
+import RestartAltIcon from "@mui/icons-material/RestartAlt";
 import SettingsOutlinedIcon from "@mui/icons-material/SettingsOutlined";
 import SyncIcon from "@mui/icons-material/Sync";
 import WarningAmberIcon from "@mui/icons-material/WarningAmber";
@@ -196,8 +197,8 @@ export function isDocumentVerified(document: {
 
 export function getDocumentStatus(document: DocumentItem): DocumentStatus {
   if (document.status === "imported") return "imported";
-  if (isDocumentVerified(document)) return "verified";
   if (document.status === "error") return "error";
+  if (isDocumentVerified(document)) return "verified";
   return "check";
 }
 
@@ -233,6 +234,9 @@ export function DocumentWorkspace({
   const [notice, setNotice] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [importDialogOpen, setImportDialogOpen] = useState(false);
+  const [reportErrorDialogOpen, setReportErrorDialogOpen] = useState(false);
+  const [reportErrorMessage, setReportErrorMessage] = useState("");
+  const [isReprocessing, setIsReprocessing] = useState(false);
   const [importDestination, setImportDestination] = useState<ImportDestination>("assigned");
   const [bulkImportCount, setBulkImportCount] = useState<number | null>(null);
   const [isCountingFolder, setIsCountingFolder] = useState(false);
@@ -518,9 +522,51 @@ export function DocumentWorkspace({
   }
 
   async function handleUpload(event: ChangeEvent<HTMLInputElement>) {
-    const files = Array.from(event.target.files ?? []);
+    const allFiles = Array.from(event.target.files ?? []);
     event.target.value = "";
-    if (files.length === 0) return;
+    if (allFiles.length === 0) return;
+
+    // Reject any files that already exist in documents (queue, imported, or errors) or duplicates in current batch
+    const existingNames = new Set(documents.map((d) => d.name.toLowerCase().trim()));
+    const seenInBatch = new Set<string>();
+    const files: File[] = [];
+    const skippedFiles: string[] = [];
+
+    for (const file of allFiles) {
+      const normalized = file.name.toLowerCase().trim();
+      if (existingNames.has(normalized) || seenInBatch.has(normalized)) {
+        skippedFiles.push(file.name);
+        continue;
+      }
+      seenInBatch.add(normalized);
+      files.push(file);
+    }
+
+    if (files.length === 0) {
+      const existingDoc = documents.find(
+        (d) => d.name.toLowerCase().trim() === allFiles[0].name.toLowerCase().trim(),
+      );
+      const tabName =
+        existingDoc?.status === "imported"
+          ? "Imported tab"
+          : existingDoc?.status === "error"
+            ? "Errors tab"
+            : "Queue";
+      showNotice(
+        allFiles.length === 1
+          ? `"${allFiles[0].name}" already exists in ${tabName} and cannot be imported again.`
+          : `All ${allFiles.length} selected files already exist in the workspace and were skipped.`,
+      );
+      return;
+    }
+
+    if (skippedFiles.length > 0) {
+      showNotice(
+        `${skippedFiles.length} duplicate file${
+          skippedFiles.length === 1 ? "" : "s"
+        } already in the workspace ${skippedFiles.length === 1 ? "was" : "were"} skipped.`,
+      );
+    }
 
     const addedDocuments = createDocumentItems(files);
     setSelectedDocumentId(null);
@@ -620,16 +666,24 @@ export function DocumentWorkspace({
       return;
     }
 
+    const existingNames = new Set(documents.map((d) => d.name.toLowerCase().trim()));
+    const newFiles = files.filter((f) => !existingNames.has(f.name.toLowerCase().trim()));
+    const skippedCount = files.length - newFiles.length;
+
     const selectedFolder = files[0].webkitRelativePath.split("/")[0] || "Selected folder";
     try {
       await saveImportFolderName(userId, selectedFolder);
       await clearLocalImportFolderHandle(userId);
       setFolderHandle(null);
-      setFolderFiles(files);
+      setFolderFiles(newFiles);
       setFolderName(selectedFolder);
-      setBulkImportCount(pendingQueueDocuments.length + files.length);
+      setBulkImportCount(pendingQueueDocuments.length + newFiles.length);
       setSettingsOpen(false);
-      showNotice(`${selectedFolder} saved to your account`);
+      showNotice(
+        skippedCount > 0
+          ? `${selectedFolder} saved. ${newFiles.length} new files ready (${skippedCount} existing files skipped).`
+          : `${selectedFolder} saved to your account (${newFiles.length} files ready)`,
+      );
     } catch (error) {
       showNotice(
         error instanceof Error ? error.message : "Unable to save the import folder",
@@ -709,20 +763,23 @@ export function DocumentWorkspace({
 
   async function handleOpenBulkImport() {
     setImportDialogOpen(true);
+    const existingNames = new Set(documents.map((d) => d.name.toLowerCase().trim()));
+    const newFolderFiles = folderFiles.filter((f) => !existingNames.has(f.name.toLowerCase().trim()));
     setBulkImportCount(
       (folderName && !folderHandle && folderFiles.length === 0) ||
         (folderHandle && folderFiles.length === 0)
         ? null
-        : pendingQueueDocuments.length + folderFiles.length,
+        : pendingQueueDocuments.length + newFolderFiles.length,
     );
 
     if (!folderHandle) return;
 
     setIsCountingFolder(true);
     try {
-      if (await folderHandle.queryPermission({ mode: "read" }) === "granted") {
+      if ((await folderHandle.queryPermission({ mode: "read" })) === "granted") {
         const files = await getImportFolderFiles(folderHandle);
-        setBulkImportCount(pendingQueueDocuments.length + files.length);
+        const newFiles = files.filter((f) => !existingNames.has(f.name.toLowerCase().trim()));
+        setBulkImportCount(pendingQueueDocuments.length + newFiles.length);
       } else {
         setBulkImportCount(null);
       }
@@ -747,7 +804,9 @@ export function DocumentWorkspace({
       }
 
       const files = await getImportFolderFiles(folderHandle);
-      setBulkImportCount(pendingQueueDocuments.length + files.length);
+      const existingNames = new Set(documents.map((d) => d.name.toLowerCase().trim()));
+      const newFiles = files.filter((f) => !existingNames.has(f.name.toLowerCase().trim()));
+      setBulkImportCount(pendingQueueDocuments.length + newFiles.length);
     } catch (error) {
       showNotice(
         error instanceof Error ? error.message : "Unable to read the selected folder",
@@ -788,8 +847,24 @@ export function DocumentWorkspace({
         }
       }
 
+      // Filter out files that already exist in documents (queue, imported, or errors)
+      const existingNames = new Set(documents.map((d) => d.name.toLowerCase().trim()));
+      const seenNames = new Set<string>();
+      const newFilesToProcess: File[] = [];
+      let duplicateCount = 0;
+
+      for (const file of filesToProcess) {
+        const key = file.name.toLowerCase().trim();
+        if (existingNames.has(key) || seenNames.has(key)) {
+          duplicateCount += 1;
+          continue;
+        }
+        seenNames.add(key);
+        newFilesToProcess.push(file);
+      }
+
       setProcessingProgress({
-        total: pendingQueueDocuments.length + filesToProcess.length,
+        total: pendingQueueDocuments.length + newFilesToProcess.length,
         completed: 0,
         currentFileName: "",
       });
@@ -822,7 +897,7 @@ export function DocumentWorkspace({
       }
 
       const folderDocuments: DocumentItem[] = [];
-      for (const file of filesToProcess) {
+      for (const file of newFilesToProcess) {
         setProcessingProgress((current) =>
           current ? { ...current, currentFileName: file.name } : current,
         );
@@ -870,7 +945,13 @@ export function DocumentWorkspace({
         Array.from(queueUpdates.values()).filter((updates) => updates.status !== "error").length;
 
       if (pendingQueueDocuments.length === 0 && folderDocuments.length === 0) {
-        showNotice(folderHandle ? `No files found in ${folderName}` : "No new files to process");
+        if (duplicateCount > 0) {
+          showNotice(
+            `All ${duplicateCount} documents in ${folderName} already exist in the workspace and were skipped.`,
+          );
+        } else {
+          showNotice(folderHandle ? `No files found in ${folderName}` : "No new files to process");
+        }
         return;
       }
 
@@ -884,8 +965,12 @@ export function DocumentWorkspace({
       setActiveTab(failedCount > 0 ? "errors" : "queue");
       setSelectedIds(new Set());
       setSelectedDocumentId(null);
+      const duplicateNotice =
+        duplicateCount > 0
+          ? ` (${duplicateCount} duplicate${duplicateCount === 1 ? "" : "s"} skipped)`
+          : "";
       showNotice(
-        `${successfulCount} file${successfulCount === 1 ? "" : "s"} added to Queue${failedCount ? `; ${failedCount} failed and moved to Errors` : ""}${folderDocuments.length && failedCount === 0 ? ` from ${folderName}` : ""}`,
+        `${successfulCount} file${successfulCount === 1 ? "" : "s"} added to Queue${failedCount ? `; ${failedCount} failed and moved to Errors` : ""}${duplicateNotice}${folderDocuments.length && failedCount === 0 ? ` from ${folderName}` : ""}`,
       );
     } finally {
       setIsImporting(false);
@@ -1024,7 +1109,7 @@ export function DocumentWorkspace({
             patientVerified,
             patientId: match?.patient.id ?? item.patientId,
             matchedIdentifierCount: match?.matchedIdentifierCount ?? (patientVerified ? 2 : 0),
-            status: item.status === "imported" ? "imported" : isVerified ? "verified" : "check",
+            status: item.status === "imported" ? "imported" : item.status === "error" ? "error" : isVerified ? "verified" : "check",
           };
         }),
       );
@@ -1055,7 +1140,7 @@ export function DocumentWorkspace({
           assignedUser,
           doctorId,
           userVerified,
-          status: item.status === "imported" ? "imported" : isVerified ? "verified" : "check",
+          status: item.status === "imported" ? "imported" : item.status === "error" ? "error" : isVerified ? "verified" : "check",
         };
       }),
     );
@@ -1074,6 +1159,105 @@ export function DocumentWorkspace({
 
   function refreshQueue(scope: "all" | "selected") {
     showNotice(scope === "all" ? "Queue refreshed" : "Selection refreshed");
+  }
+
+  function handleOpenReportErrorDialog() {
+    if (!selectedDocument) return;
+    setReportErrorMessage(selectedDocument.processingError || "");
+    setReportErrorDialogOpen(true);
+  }
+
+  function handleConfirmReportError() {
+    if (!selectedDocument) return;
+    const msg = reportErrorMessage.trim() || "Flagged as error by user";
+    updateDocument(selectedDocument.id, {
+      status: "error",
+      processingError: msg,
+    });
+    setReportErrorDialogOpen(false);
+    setReportErrorMessage("");
+    setActiveTab("errors");
+    showNotice(`"${selectedDocument.name}" flagged as error and moved to Errors tab`);
+  }
+
+  function handleResetDocumentToDefault() {
+    if (!selectedDocument) return;
+
+    const defaultReportDate = selectedDocument.fileLastModified
+      ? new Date(selectedDocument.fileLastModified).toISOString().slice(0, 10)
+      : new Date().toISOString().slice(0, 10);
+
+    updateDocument(selectedDocument.id, {
+      patient: "",
+      patientId: undefined,
+      dateOfBirth: "",
+      patientVerified: false,
+      matchedIdentifierCount: 0,
+      demographics: emptyNewPatientInput(),
+      category: "",
+      reportDate: defaultReportDate,
+      subject: "",
+      contact: "",
+      storeIn: "Correspondence",
+      inbox: "Doctor's Inbox",
+      assignedUser: "",
+      doctorId: undefined,
+      userVerified: false,
+      status: "check",
+      processingError: undefined,
+      highlights: [],
+    });
+
+    setActiveHighlightField(null);
+    if (activeTab !== "queue") {
+      setActiveTab("queue");
+    }
+    showNotice(`All fields reset for "${selectedDocument.name}"`);
+  }
+
+  async function handleReprocessDocument() {
+    if (!selectedDocument || isReprocessing) return;
+    if (!selectedDocument.previewUrl) {
+      showNotice("The document preview file is unavailable for reprocessing");
+      return;
+    }
+
+    setIsReprocessing(true);
+    try {
+      const fileResponse = await fetch(selectedDocument.previewUrl);
+      if (!fileResponse.ok) {
+        throw new Error("Could not read document file");
+      }
+      const blob = await fileResponse.blob();
+      const file = new File([blob], selectedDocument.name, {
+        type: selectedDocument.mimeType || blob.type,
+        lastModified: selectedDocument.fileLastModified,
+      });
+
+      const processed = await processDocumentFile(file);
+      const updated = await mapExtraction(selectedDocument, processed);
+
+      setDocuments((current) =>
+        current.map((item) => (item.id === selectedDocument.id ? updated : item)),
+      );
+      setActiveHighlightField(null);
+      if (activeTab !== "queue") {
+        setActiveTab("queue");
+      }
+      showNotice(`"${selectedDocument.name}" reprocessed successfully`);
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : "Reprocessing failed";
+      updateDocument(selectedDocument.id, {
+        status: "error",
+        processingError: errorMsg,
+      });
+      if (activeTab !== "errors") {
+        setActiveTab("errors");
+      }
+      showNotice(`Reprocessing failed for "${selectedDocument.name}": ${errorMsg}`);
+    } finally {
+      setIsReprocessing(false);
+    }
   }
 
   return (
@@ -1411,8 +1595,8 @@ export function DocumentWorkspace({
                           ? "Folder access required"
                           : "Grant access to count documents"
                       : bulkImportCount === 0
-                        ? "No documents to import"
-                        : `${bulkImportCount} document${bulkImportCount === 1 ? "" : "s"} selected`}
+                        ? "No new documents to import"
+                        : `${bulkImportCount} new document${bulkImportCount === 1 ? "" : "s"} selected`}
                   </Typography>
                   <Typography variant="body2" color="text.secondary">
                     Destination: {importDestination === "assigned"
@@ -2105,8 +2289,13 @@ export function DocumentWorkspace({
                 )}
 
                 {selectedDocument.status === "error" && (
-                  <Alert severity="warning">
-                    Review this document before filing. Check the required information below.
+                  <Alert severity="error">
+                    <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
+                      Reported Error / Issue
+                    </Typography>
+                    <Typography variant="body2" sx={{ mt: 0.25 }}>
+                      {selectedDocument.processingError || "Review this document before filing. Check the required information below."}
+                    </Typography>
                   </Alert>
                 )}
 
@@ -2143,7 +2332,7 @@ export function DocumentWorkspace({
                             assignedUser: matched ? matched.fullName : assignedUser,
                             doctorId,
                             userVerified,
-                            status: selectedDocument.status === "imported" ? "imported" : isVerified ? "verified" : "check",
+                            status: selectedDocument.status === "imported" ? "imported" : selectedDocument.status === "error" ? "error" : isVerified ? "verified" : "check",
                           });
                         }}
                         aria-label="Inbox Type"
@@ -2176,7 +2365,28 @@ export function DocumentWorkspace({
                           (record) => record.fullName === fullName,
                         );
                         const dateOfBirth = matchedRecord?.dateOfBirth ?? selectedDocument.dateOfBirth;
-                        updateDocument(selectedDocument.id, { patient: fullName, dateOfBirth });
+                        const patientVerified = Boolean(matchedRecord) || Boolean(fullName.trim());
+                        const isVerified = isDocumentVerified({
+                          inbox: selectedDocument.inbox,
+                          patientVerified,
+                          userVerified: selectedDocument.userVerified,
+                        });
+
+                        updateDocument(selectedDocument.id, {
+                          patient: fullName,
+                          patientId: matchedRecord?.id ?? selectedDocument.patientId,
+                          dateOfBirth,
+                          patientVerified,
+                          matchedIdentifierCount: matchedRecord ? 2 : (selectedDocument.matchedIdentifierCount || 1),
+                          status:
+                            selectedDocument.status === "imported"
+                              ? "imported"
+                              : selectedDocument.status === "error"
+                                ? "error"
+                                : isVerified
+                                  ? "verified"
+                                  : "check",
+                        });
                         void verifyPatientMatch(selectedDocument.id, fullName, dateOfBirth);
                       }}
                       renderInput={(params) => (
@@ -2384,6 +2594,143 @@ export function DocumentWorkspace({
                     )}
                   </Box>
                 </Stack>
+
+                <Divider sx={{ my: 1.5 }} />
+
+                <Box sx={{ pt: 0.5 }}>
+                  <Button
+                    variant="contained"
+                    color={selectedDocument.status === "imported" ? "info" : "primary"}
+                    fullWidth
+                    size="medium"
+                    disabled={getDocumentStatus(selectedDocument) !== "verified"}
+                    startIcon={selectedDocument.status === "imported" ? <CheckIcon /> : <MoveToInboxIcon />}
+                    onClick={() => {
+                      if (getDocumentStatus(selectedDocument) !== "verified") return;
+                      updateDocument(selectedDocument.id, { status: "imported" });
+                      showNotice(`"${selectedDocument.name}" moved to Imported tab`);
+                    }}
+                    sx={{
+                      py: 1.25,
+                      fontWeight: 700,
+                      fontSize: "0.95rem",
+                      textTransform: "none",
+                      borderRadius: 1.5,
+                      boxShadow:
+                        getDocumentStatus(selectedDocument) === "verified"
+                          ? "0 4px 14px rgba(37, 99, 235, 0.35)"
+                          : "none",
+                    }}
+                  >
+                    {selectedDocument.status === "imported" ? "Imported" : "Import Document"}
+                  </Button>
+                  {selectedDocument.status === "imported" ? (
+                    <Typography
+                      variant="caption"
+                      color="success.main"
+                      sx={{ display: "block", textAlign: "center", mt: 0.75, fontWeight: 600 }}
+                    >
+                      Document imported successfully
+                    </Typography>
+                  ) : getDocumentStatus(selectedDocument) === "error" ? (
+                    <Typography
+                      variant="caption"
+                      color="error.main"
+                      sx={{ display: "block", textAlign: "center", mt: 0.75, fontWeight: 500 }}
+                    >
+                      Resolve the error or reprocess document to enable import
+                    </Typography>
+                  ) : getDocumentStatus(selectedDocument) !== "verified" ? (
+                    <Typography
+                      variant="caption"
+                      color="text.secondary"
+                      sx={{ display: "block", textAlign: "center", mt: 0.75 }}
+                    >
+                      {selectedDocument.inbox === "Patient's File"
+                        ? "Verify the patient to enable import"
+                        : !selectedDocument.patientVerified && !selectedDocument.userVerified
+                          ? "Verify patient and doctor to enable import"
+                          : !selectedDocument.patientVerified
+                            ? "Verify the patient to enable import"
+                            : "Verify the GP doctor to enable import"}
+                    </Typography>
+                  ) : null}
+                </Box>
+
+                <Divider sx={{ my: 1.5 }} />
+
+                <Stack spacing={1}>
+                  <Button
+                    variant="outlined"
+                    color="primary"
+                    fullWidth
+                    size="medium"
+                    startIcon={
+                      isReprocessing ? (
+                        <CircularProgress size={16} color="inherit" />
+                      ) : (
+                        <RefreshIcon />
+                      )
+                    }
+                    disabled={isReprocessing}
+                    onClick={handleReprocessDocument}
+                    sx={{
+                      py: 0.9,
+                      fontWeight: 600,
+                      fontSize: "0.875rem",
+                      textTransform: "none",
+                      borderRadius: 1.5,
+                    }}
+                  >
+                    {isReprocessing ? "Reprocessing Document..." : "Reprocess Document"}
+                  </Button>
+
+                  <Stack direction={{ xs: "column", sm: "row" }} spacing={1}>
+                    <Button
+                      variant="outlined"
+                      color="inherit"
+                      fullWidth
+                      size="medium"
+                      startIcon={<RestartAltIcon />}
+                      disabled={isReprocessing}
+                      onClick={handleResetDocumentToDefault}
+                      sx={{
+                        py: 0.85,
+                        fontWeight: 600,
+                        fontSize: "0.85rem",
+                        textTransform: "none",
+                        borderRadius: 1.5,
+                        borderColor: "divider",
+                        color: "text.primary",
+                        "&:hover": {
+                          borderColor: "text.secondary",
+                          bgcolor: "action.hover",
+                        },
+                      }}
+                    >
+                      Reset to Default
+                    </Button>
+
+                    <Button
+                      variant="outlined"
+                      color="error"
+                      fullWidth
+                      size="medium"
+                      startIcon={<FlagOutlinedIcon />}
+                      disabled={isReprocessing}
+                      onClick={handleOpenReportErrorDialog}
+                      sx={{
+                        py: 0.85,
+                        fontWeight: 600,
+                        fontSize: "0.85rem",
+                        textTransform: "none",
+                        borderRadius: 1.5,
+                      }}
+                    >
+                      Report Error
+                    </Button>
+                  </Stack>
+                </Stack>
               </Stack>
             )}
           </Paper>
@@ -2453,6 +2800,47 @@ export function DocumentWorkspace({
             </Typography>
           </Stack>
         </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={reportErrorDialogOpen}
+        onClose={() => setReportErrorDialogOpen(false)}
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle sx={{ fontWeight: 700, pb: 1 }}>
+          Report Document Error
+        </DialogTitle>
+        <DialogContent>
+          <Stack spacing={2} sx={{ pt: 1 }}>
+            <Typography variant="body2" color="text.secondary">
+              Report an issue with <strong>{selectedDocument?.name}</strong>. Entering an error message or reason helps track why this document was flagged and moves it to the <strong>Errors</strong> tab.
+            </Typography>
+            <TextField
+              autoFocus
+              label="Error message / reason"
+              placeholder="e.g. Unreadable handwriting, incorrect document format, missing patient details..."
+              value={reportErrorMessage}
+              onChange={(e) => setReportErrorMessage(e.target.value)}
+              multiline
+              rows={4}
+              fullWidth
+            />
+          </Stack>
+        </DialogContent>
+        <DialogActions sx={{ px: 3, pb: 2.5 }}>
+          <Button onClick={() => setReportErrorDialogOpen(false)} color="inherit">
+            Cancel
+          </Button>
+          <Button
+            variant="contained"
+            color="error"
+            startIcon={<FlagOutlinedIcon />}
+            onClick={handleConfirmReportError}
+          >
+            Move to Errors
+          </Button>
+        </DialogActions>
       </Dialog>
 
       <Snackbar
