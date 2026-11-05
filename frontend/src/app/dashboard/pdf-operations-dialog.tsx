@@ -71,7 +71,7 @@ export function PdfOperationsDialog({ operation, onClose, onSave }: {
     try {
       const files = operation.mode === "split"
         ? await splitPdf(bytes.get(sources[0].id)!, ranges)
-        : [preview!.file];
+        : [preview?.file ?? await mergePdfs(sources.map((source) => bytes.get(source.id)!), name)];
       await onSave(files);
       onClose();
     } catch (reason) { setError(reason instanceof Error ? reason.message : "Could not save documents."); }
@@ -110,7 +110,7 @@ export function PdfOperationsDialog({ operation, onClose, onSave }: {
     </DialogContent>
     <DialogActions>
       <Button onClick={onClose} disabled={busy}>Cancel</Button>
-      <Button variant="contained" onClick={save} disabled={busy || !loaded || (operation.mode === "merge" ? !preview : pageCount < 2)}>{busy ? "Processing and saving…" : operation.mode === "split" ? "Split and process" : "Save and process merged PDF"}</Button>
+      <Button variant="contained" onClick={save} disabled={busy || !loaded || (operation.mode === "merge" ? !name.trim() || sources.length < 2 : pageCount < 2)}>{busy ? "Processing and saving…" : operation.mode === "split" ? "Split and process" : "Save and process merged PDF"}</Button>
     </DialogActions>
   </Dialog>;
 }

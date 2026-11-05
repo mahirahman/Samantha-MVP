@@ -15,15 +15,46 @@ beforeEach(() => {
   onSave.mockResolvedValue(undefined);
 });
 function open(operation: PdfOperation) { render(<PdfOperationsDialog operation={operation} onSave={onSave} onClose={onClose} />); }
-it("requires a merge preview and invalidates it when the filename changes", async () => {
+it("makes preview optional and keeps saving enabled when the filename changes", async () => {
   open({ mode: "merge", sources: [first, second] });
   const save = screen.getByRole("button", { name: "Save and process merged PDF" });
-  expect(save).toBeDisabled();
+  await waitFor(() => expect(save).toBeEnabled());
   const preview = screen.getByRole("button", { name: "Preview merged PDF" });
   await waitFor(() => expect(preview).toBeEnabled()); fireEvent.click(preview);
   expect(await screen.findByText("Merged preview")).toBeInTheDocument(); expect(save).toBeEnabled();
   fireEvent.change(screen.getByLabelText("Merged filename"), { target: { value: "Other.pdf" } });
+  expect(save).toBeEnabled();
+  expect(screen.queryByText("Merged preview")).not.toBeInTheDocument();
+  fireEvent.click(save);
+  await waitFor(() => expect(mergePdfs).toHaveBeenLastCalledWith(expect.any(Array), "Other.pdf"));
+  await waitFor(() => expect(onSave).toHaveBeenCalled());
+});
+it("saves directly without preview using the current filename and page order", async () => {
+  const bytesA = new ArrayBuffer(1), bytesB = new ArrayBuffer(2);
+  vi.stubGlobal("fetch", vi.fn(async (url) => ({ ok: true, arrayBuffer: async () => url === "blob:a" ? bytesA : bytesB })));
+  open({ mode: "merge", sources: [first, second] });
+  const save = screen.getByRole("button", { name: "Save and process merged PDF" });
+  await waitFor(() => expect(save).toBeEnabled());
+  fireEvent.click(screen.getByRole("button", { name: "Move B.pdf up" }));
+  fireEvent.change(screen.getByLabelText("Merged filename"), { target: { value: "Direct.pdf" } });
+  fireEvent.click(save);
+  await waitFor(() => expect(onSave).toHaveBeenCalled());
+  expect(mergePdfs).toHaveBeenCalledWith([bytesB, bytesA], "Direct.pdf");
+  expect(screen.queryByText("Merged preview")).not.toBeInTheDocument();
+});
+it("prevents direct saving with a blank filename and reports merge failures", async () => {
+  open({ mode: "merge", sources: [first, second] });
+  const save = screen.getByRole("button", { name: "Save and process merged PDF" });
+  await waitFor(() => expect(save).toBeEnabled());
+  fireEvent.change(screen.getByLabelText("Merged filename"), { target: { value: " " } });
   expect(save).toBeDisabled();
+  fireEvent.change(screen.getByLabelText("Merged filename"), { target: { value: "Merged.pdf" } });
+  vi.mocked(mergePdfs).mockRejectedValueOnce(new Error("Invalid source PDF"));
+  fireEvent.click(save);
+  expect(await screen.findByText("Invalid source PDF")).toBeInTheDocument();
+  expect(onSave).not.toHaveBeenCalled();
+  expect(onClose).not.toHaveBeenCalled();
+  expect(save).toBeEnabled();
 });
 it("merges in the reordered source sequence and saves the previewed file", async () => {
   const bytesA = new ArrayBuffer(1), bytesB = new ArrayBuffer(2);
