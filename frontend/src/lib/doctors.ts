@@ -37,9 +37,10 @@ export async function listDoctors(): Promise<DoctorRecord[]> {
 
 export function cleanDoctorName(name: string): string {
   return (name ?? "")
+    .normalize("NFKC")
     .toLowerCase()
-    .replace(/^(dr\.?|doctor|prof\.?|professor|assoc\.?\s*prof\.?|a\/prof\.?)\s+/i, "")
     .replace(/[,.]/g, " ")
+    .replace(/^\s*(?:(?:dr|doctor|professor|prof|assoc\s*prof|a\/prof)\s+)+/i, "")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -52,6 +53,7 @@ export function cleanDoctorName(name: string): string {
  * 2. Title- and punctuation-normalized match (e.g. "Dr. Sarah Jenkins" == "Dr Sarah Jenkins")
  * 3. Token-based matching (e.g. "Sarah Jenkins" or "Jenkins, Sarah" matching "Dr Sarah Jenkins")
  * 4. Surname-only match when a doctor title was present and only one doctor shares that surname
+ * 5. A conservative closest-name match for small typos, with ambiguous results rejected
  */
 export function matchDoctorByName(
   rawName: string,
@@ -82,11 +84,11 @@ export function matchDoctorByName(
         (rawTokens.length === docTokens.length &&
           rawTokens.every((t, i) => {
             const dt = docTokens[i];
-            return dt === t || dt.startsWith(t) || t.startsWith(dt);
+            return dt === t || (t.length === 1 && dt.startsWith(t));
           }))
       );
     });
-    if (tokenMatches.length === 1) return tokenMatches[0];
+    if (tokenMatches.length > 0) return tokenMatches.length === 1 ? tokenMatches[0] : null;
   }
 
   // 4. Surname match with title (e.g. "Dr Jenkins" where raw has 1 token and title was present)
@@ -100,6 +102,37 @@ export function matchDoctorByName(
     if (surnameMatches.length === 1) return surnameMatches[0];
   }
 
-  return null;
+  // Small OCR/model typos: require a full name, at most one edit per token,
+  // >=85% overall similarity, and a clear lead over the second candidate.
+  if (rawTokens.length < 2) return null;
+  const rawSorted = [...rawTokens].sort();
+  const ranked = doctors.map((doctor) => {
+    const tokens = cleanDoctorName(doctor.fullName).split(" ").filter(Boolean).sort();
+    if (tokens.length !== rawSorted.length) return { doctor, score: 0 };
+    let edits = 0;
+    let length = 0;
+    for (let i = 0; i < tokens.length; i++) {
+      const distance = nameDistance(rawSorted[i], tokens[i]);
+      if (distance > 1 || (distance > 0 && Math.min(rawSorted[i].length, tokens[i].length) < 4)) return { doctor, score: 0 };
+      edits += distance;
+      length += Math.max(rawSorted[i].length, tokens[i].length);
+    }
+    return { doctor, score: length ? 1 - edits / length : 0 };
+  }).sort((a, b) => b.score - a.score);
+  return ranked[0]?.score >= 0.85 && ranked[0].score - (ranked[1]?.score ?? 0) >= 0.1 ? ranked[0].doctor : null;
+}
+
+function nameDistance(left: string, right: string): number {
+  if (left === right) return 0;
+  if (Math.abs(left.length - right.length) > 1) return 2;
+  let previous = Array.from({ length: right.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= left.length; i++) {
+    const current = [i];
+    for (let j = 1; j <= right.length; j++) {
+      current[j] = Math.min(current[j - 1] + 1, previous[j] + 1, previous[j - 1] + (left[i - 1] === right[j - 1] ? 0 : 1));
+    }
+    previous = current;
+  }
+  return previous[right.length];
 }
 

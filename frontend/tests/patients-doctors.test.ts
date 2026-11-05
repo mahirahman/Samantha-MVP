@@ -74,6 +74,21 @@ describe("doctors", () => {
   });
 });
 
+describe("closest GP matching", () => {
+  const doctors = [{ id: "berry", fullName: "Berry Graham" }, { id: "naomi", fullName: "Naomi Heath" }];
+  it.each(["Dr Berry Graham", "Dr. Berry. Graham", " Berry. Graham ", "Dr.Berry Graham", "Bery Graham", "Berry Grahm", "Grahm Berry"])("matches %s to the canonical database ID", (name) => {
+    expect(matchDoctorByName(name, doctors)?.id).toBe("berry");
+  });
+  it("does not accept a weak or ambiguous closest match", () => {
+    expect(matchDoctorByName("Unknown Person", doctors)).toBeNull();
+    expect(matchDoctorByName("Bery", doctors)).toBeNull();
+    expect(matchDoctorByName("Bery Graham", [...doctors, { id: "barry", fullName: "Bary Graham" }])).toBeNull();
+  });
+  it("never uses inactive or fallback records as closest matches", () => {
+    expect(matchDoctorByName("Bery Graham", [{ id: "fallback-doctor", fullName: "Berry Graham" }, { id: "inactive", fullName: "Berry Graham", active: false }])).toBeNull();
+  });
+});
+
 
 describe("patient creation feedback", () => {
   it("lists missing required fields without submitting to the database", async () => {

@@ -37,6 +37,23 @@ it("shows login failures and allows retry", async () => {
   expect(screen.getByRole("button", { name: "Sign in" })).toBeEnabled();
   expect(router.replace).not.toHaveBeenCalled();
 });
+it("signs in the seeded admin username through its email alias", async () => {
+  render(<LoginPage />);
+  fireEvent.change(screen.getByLabelText(/^Email/), { target: { value: " Admin " } });
+  fireEvent.change(screen.getByLabelText(/^Password/), { target: { value: "admin" } });
+  fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+  await waitFor(() => expect(auth.signInWithPassword).toHaveBeenCalledWith({ email: "admin@example.test", password: "admin" }));
+  expect(router.replace).toHaveBeenCalledWith("/dashboard");
+});
+it("does not bypass authentication for the admin alias", async () => {
+  auth.signInWithPassword.mockResolvedValue({ error: new Error("Invalid credentials") });
+  render(<LoginPage />);
+  fireEvent.change(screen.getByLabelText(/^Email/), { target: { value: "admin" } });
+  fireEvent.change(screen.getByLabelText(/^Password/), { target: { value: "wrong" } });
+  fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent("Invalid credentials");
+  expect(router.replace).not.toHaveBeenCalled();
+});
 it.each([
   ["invalid", "Password1!", "Password1!", "Enter a valid email address."],
   ["test@example.test", "short", "short", "Use 8+ characters"],

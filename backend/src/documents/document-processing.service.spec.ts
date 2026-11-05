@@ -159,6 +159,37 @@ describe("DocumentProcessingService", () => {
       "x".repeat(120_001),
     );
   });
+  it("normalizes Gemini GP names and highlights punctuated OCR names", async () => {
+    generateContent.mockResolvedValue({
+      text: JSON.stringify({
+        gpDoctor: "Dr. Berry. Graham",
+        category: "Letter",
+      }),
+    });
+    pollUntilDone.mockResolvedValue({
+      content: "Dr. Berry. Graham",
+      pages: [
+        {
+          pageNumber: 1,
+          width: 10,
+          height: 10,
+          lines: [
+            { content: "Dr. Berry. Graham", polygon: [1, 1, 5, 1, 5, 2, 1, 2] },
+          ],
+        },
+      ],
+    });
+    const result = await service.process(file);
+    expect(result.extraction.gpDoctor).toBe("Berry Graham");
+    expect(result.highlights).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          fieldName: "assignedUser",
+          text: "Berry Graham",
+        }),
+      ]),
+    );
+  });
   it("requires project and location when Vertex AI is selected", async () => {
     config.GOOGLE_GENAI_USE_VERTEXAI = "true";
     await expect(service.process(file)).rejects.toThrow("project and location");

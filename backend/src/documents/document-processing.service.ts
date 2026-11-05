@@ -10,6 +10,7 @@ import {
   DocumentAnalysisClient,
 } from "@azure/ai-form-recognizer";
 import { GoogleGenAI } from "@google/genai";
+import { normalizeDoctorName } from "./doctor-name";
 
 export interface UploadedDocument {
   buffer: Buffer;
@@ -380,7 +381,8 @@ export class DocumentProcessingService {
         const lowerCand = candidate.toLowerCase();
         for (const line of lines) {
           const lineContent = String(line.content || "");
-          if (lineContent.toLowerCase().includes(lowerCand)) {
+          const searchableLine = fieldName === "assignedUser" ? normalizeDoctorName(lineContent) : lineContent;
+          if (searchableLine.toLowerCase().includes(lowerCand)) {
             const bbox = this.getPolygonBounds(line.polygon, pageWidth, pageHeight);
             if (bbox) {
               return {
@@ -522,7 +524,7 @@ export class DocumentProcessingService {
         storeIn: storeIn === "Correspondence" || storeIn === "Investigations"
           ? storeIn
           : "",
-        gpDoctor: stringValue(parsed.gpDoctor),
+        gpDoctor: normalizeDoctorName(parsed.gpDoctor),
         category: stringValue(parsed.category),
       };
     } catch (error) {

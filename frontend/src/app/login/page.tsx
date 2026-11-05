@@ -28,7 +28,7 @@ export default function LoginPage() {
 
     try {
       const { error } = await getSupabaseClient().auth.signInWithPassword({
-        email,
+        email: email.trim().toLowerCase() === "admin" ? "admin@example.test" : email.trim(),
         password,
       });
 
@@ -75,9 +75,9 @@ export default function LoginPage() {
           </Box>
 
           <TextField
-            label="Email"
-            type="email"
-            autoComplete="email"
+            label="Email or username"
+            type="text"
+            autoComplete="username"
             value={email}
             onChange={(event) => setEmail(event.target.value)}
             required

@@ -2506,7 +2506,7 @@ export function DocumentWorkspace({
                           getOptionKey={(doctor) => doctor.id}
                           getOptionLabel={(doctor) => doctor.fullName}
                           isOptionEqualToValue={(option, value) => option.id === value.id}
-                          renderOption={(props, doctor) => <li {...props} key={doctor.id}><Stack><Typography>{doctor.fullName}</Typography><Typography variant="caption">{doctor.email || ""} ? ID: {doctor.id}</Typography></Stack></li>}
+                          renderOption={(props, doctor) => <li {...props} key={doctor.id}><Stack><Typography>{doctor.fullName}</Typography><Typography variant="caption">{doctor.email || ""} ID: {doctor.id}</Typography></Stack></li>}
                           value={doctorRecords.find((doctor) => doctor.id === selectedDocument.doctorId && doctor.active !== false && !doctor.id.startsWith("fallback-")) ?? null}
                           onFocus={() => setActiveHighlightField("assignedUser")}
                           onChange={(_, doctor) => handleDoctorSelection(selectedDocument, doctor)}
