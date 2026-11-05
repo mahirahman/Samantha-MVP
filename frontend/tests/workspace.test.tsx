@@ -1,5 +1,5 @@
 import { beforeEach, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { DocumentWorkspace, getDocumentStatus, isDocumentVerified } from "@/app/dashboard/document-workspace";
 import * as documents from "@/lib/documents";
 import { listPatients, matchPatientIdentifiers } from "@/lib/patients";
@@ -184,7 +184,10 @@ it("category changes update routing, reset default storage and clear the GP when
   fireEvent.mouseDown(screen.getByRole("combobox", { name: /^Category/ }));
   fireEvent.click(screen.getByRole("option", { name: "Medical imaging report" }));
   await waitFor(() => expect(documents.saveWorkspaceDocument).toHaveBeenLastCalledWith(expect.objectContaining({ inbox: "Doctor's Inbox", storeIn: "Investigations", doctorId: undefined, userVerified: false }), "user"));
-  expect(screen.getByLabelText("Inbox Type")).toHaveAttribute("readonly");
+  expect(screen.getByRole("radiogroup", { name: "Inbox Type" })).toBeInTheDocument();
+  expect(screen.getByRole("radio", { name: "Doctor's Inbox" })).toBeChecked();
+  expect(screen.getByRole("radio", { name: "Doctor's Inbox" })).toBeEnabled();
+  expect(screen.getByRole("radio", { name: "Patient's File" })).toBeEnabled();
 });
 it("applies a storage selection only to selected Queue documents", async () => {
   vi.mocked(documents.listWorkspaceDocuments).mockResolvedValue([doc, { ...doc, id: "other", name: "Other.pdf" }]);
@@ -276,13 +279,16 @@ it("makes imported documents read-only while keeping preview and navigation avai
   vi.mocked(documents.listWorkspaceDocuments).mockResolvedValue([imported, { ...imported, id: "second", name: "Second.pdf" }]);
   await openWorkspace(); fireEvent.click(screen.getByRole("tab", { name: /Imported/ }));
   fireEvent.click(screen.getByText("Test.pdf"));
-  for (const label of [/^Patient/, /^User/, /^Category/, /^Date of birth/, /^Date of report/, /^Subject/, /^Contact of source/, /^Store in/]) {
+  for (const label of [/^Patient(?:\s|$)/, /^User/, /^Category/, /^Date of birth/, /^Date of report/, /^Subject/, /^Contact of source/, /^Store in/]) {
     const field = screen.getByLabelText(label);
     if (field.getAttribute("role") === "combobox" && field.tagName !== "INPUT") {
       expect(field).toHaveAttribute("aria-disabled", "true");
     } else expect(field).toBeDisabled();
   }
-  expect(screen.getByLabelText("Inbox Type")).toHaveAttribute("readonly");
+  expect(screen.getByRole("radiogroup", { name: "Inbox Type" })).toBeInTheDocument();
+  expect(screen.getByRole("radio", { name: "Doctor's Inbox" })).toBeChecked();
+  expect(screen.getByRole("radio", { name: "Doctor's Inbox" })).toBeDisabled();
+  expect(screen.getByRole("radio", { name: "Patient's File" })).toBeDisabled();
   for (const name of ["Reprocess Document", "Reset to Default", "Report Error"]) {
     expect(screen.getByRole("button", { name })).toBeDisabled();
   }
@@ -293,4 +299,31 @@ it("makes imported documents read-only while keeping preview and navigation avai
   await waitFor(() => expect(screen.getByLabelText(/^Subject/)).toHaveValue("Original subject"));
   expect(documents.saveWorkspaceDocument).not.toHaveBeenCalled();
   expect(processDocumentFile).not.toHaveBeenCalled();
+});
+
+
+it("does not scan the saved folder automatically", async () => {
+  vi.useFakeTimers();
+  try {
+    const handle: ImportDirectoryHandle = { kind: "directory", name: "Inbox", queryPermission: vi.fn(async () => "granted" as const), requestPermission: vi.fn(), async *values() {} };
+    vi.mocked(loadImportFolder).mockResolvedValue({ handle, folderName: "Inbox" });
+    await act(async () => { render(<DocumentWorkspace userId="user" email="test@example.test" errorMessage="" onSignOut={vi.fn()} />); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(180_000); });
+    expect(screen.queryByLabelText("Automatic folder scan status")).not.toBeInTheDocument();
+    expect(getImportFolderFiles).not.toHaveBeenCalled();
+    expect(processDocumentFile).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Auto Bulk Import" })).toBeEnabled();
+  } finally { cleanup(); vi.useRealTimers(); }
+});
+
+it("allows Inbox Type radio overrides in Queue and requires a verified GP when switching back", async () => {
+  vi.mocked(documents.listWorkspaceDocuments).mockResolvedValue([{ ...doc, category: "Letter", patientId: "p1", patientVerified: true, doctorId: "d1", assignedUser: "Dr Test", userVerified: true, subject: "Report", contact: "Clinic", reportDate: "2026-11-05" }]);
+  await openWorkspace(); fireEvent.click(screen.getByText("Test.pdf"));
+  fireEvent.click(screen.getByRole("radio", { name: "Patient's File" }));
+  expect(screen.getByRole("radio", { name: "Patient's File" })).toBeChecked();
+  expect(screen.getByRole("button", { name: "Import Document" })).toBeEnabled();
+  await waitFor(() => expect(documents.saveWorkspaceDocument).toHaveBeenLastCalledWith(expect.objectContaining({ inbox: "Patient's File", category: "Letter", doctorId: undefined, userVerified: false }), "user"));
+  fireEvent.click(screen.getByRole("radio", { name: "Doctor's Inbox" }));
+  expect(screen.getByRole("radio", { name: "Doctor's Inbox" })).toBeChecked();
+  expect(screen.getByRole("button", { name: "Import Document" })).toBeDisabled();
 });

@@ -26,6 +26,7 @@ beforeAll(async () => {
   await db.exec(readFileSync(new URL("../../supabase/migrations/20261105070000_atomic_document_filing.sql", import.meta.url), "utf8"));
   await db.exec(readFileSync(new URL("../../supabase/migrations/20261105080000_strict_identity_and_category_routing.sql", import.meta.url), "utf8"));
   await db.exec(readFileSync(new URL("../../supabase/migrations/20261105090000_preserve_extracted_patient.sql", import.meta.url), "utf8"));
+  await db.exec(readFileSync(new URL("../../supabase/migrations/20261105110000_allow_reviewed_inbox_override.sql", import.meta.url), "utf8"));
   await db.exec(`grant select, insert, update on all tables in schema public to authenticated;
     insert into auth.users(id) values ('${user}');
     create function public.simulate_filing_failure() returns trigger language plpgsql as $$ begin
@@ -85,11 +86,11 @@ it("rejects unauthenticated requests and another user's document", async () => {
 });
 
 
-it("rejects mismatched patient names/DOBs, GP names, and category routing", async () => {
+it("rejects mismatched patient names/DOBs and GP names", async () => {
   await expect(file({ patient_name: "Different Patient" })).rejects.toThrow("does not match");
   await expect(file({ patient_dob: "2001-01-01" })).rejects.toThrow("does not match");
   await expect(file({ assigned_user: "Different GP" })).rejects.toThrow("does not match");
-  await expect(file({ inbox: "Patient's File" })).rejects.toThrow("must follow the document category");
+  await expect(file({ inbox: "Patient's File" })).resolves.toBeDefined();
 });
 
 

@@ -134,6 +134,7 @@ function normalizeHighlights(value: unknown): DocumentHighlight[] {
 
 export async function processDocumentFile(
   file: File,
+  signal?: AbortSignal,
 ): Promise<DocumentProcessingResult> {
   const apiUrl = process.env.NEXT_PUBLIC_API_URL;
   if (!apiUrl) throw new Error("The document-processing API URL is not configured");
@@ -151,6 +152,7 @@ export async function processDocumentFile(
     `${apiUrl.replace(/\/$/, "")}/documents/process`,
     {
       method: "POST",
+      signal,
       headers: { Authorization: `Bearer ${accessToken}` },
       body: formData,
     },

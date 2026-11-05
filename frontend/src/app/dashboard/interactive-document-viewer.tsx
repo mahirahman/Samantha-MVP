@@ -390,11 +390,14 @@ export function InteractiveDocumentViewer({
 
     const timer = setTimeout(() => {
       const el = document.getElementById(`doc-highlight-${activeField}`);
-      if (el) {
-        el.scrollIntoView({
+      const container = containerRef.current;
+      if (el && container) {
+        const target = el.getBoundingClientRect();
+        const viewport = container.getBoundingClientRect();
+        container.scrollTo({
+          top: container.scrollTop + target.top - viewport.top - container.clientHeight / 2 + target.height / 2,
+          left: container.scrollLeft + target.left - viewport.left - container.clientWidth / 2 + target.width / 2,
           behavior: "smooth",
-          block: "center",
-          inline: "center",
         });
       }
     }, 60);
@@ -423,6 +426,8 @@ export function InteractiveDocumentViewer({
         flexDirection: "column",
         width: "100%",
         height: "100%",
+        minHeight: 0,
+        minWidth: 0,
         bgcolor: "#edf1f4",
         position: "relative",
         overflow: "hidden",
@@ -519,7 +524,10 @@ export function InteractiveDocumentViewer({
         ref={containerRef}
         sx={{
           flex: 1,
+          minHeight: 0,
+          minWidth: 0,
           overflow: "auto",
+          overscrollBehavior: "contain",
           p: 3,
           display: "flex",
           flexDirection: "column",

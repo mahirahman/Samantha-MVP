@@ -15,6 +15,12 @@ import Dialog from "@mui/material/Dialog";
 import DialogActions from "@mui/material/DialogActions";
 import DialogContent from "@mui/material/DialogContent";
 import DialogTitle from "@mui/material/DialogTitle";
+import FormControl from "@mui/material/FormControl";
+import FormControlLabel from "@mui/material/FormControlLabel";
+import FormHelperText from "@mui/material/FormHelperText";
+import FormLabel from "@mui/material/FormLabel";
+import Radio from "@mui/material/Radio";
+import RadioGroup from "@mui/material/RadioGroup";
 import IconButton from "@mui/material/IconButton";
 import LinearProgress from "@mui/material/LinearProgress";
 import MenuItem from "@mui/material/MenuItem";
@@ -200,6 +206,7 @@ export function DocumentWorkspace({
   const uploadInput = useRef<HTMLInputElement>(null);
   const folderInput = useRef<HTMLInputElement>(null);
   const previewUrls = useRef(new Set<string>());
+  const operationLock = useRef(false);
 
   useEffect(() => {
     let active = true;
@@ -430,6 +437,17 @@ export function DocumentWorkspace({
     updateDocument(document.id, next);
   }
 
+  function handleInboxChange(document: DocumentItem, inbox: StoredDocumentItem["inbox"]) {
+    if (activeTab !== "queue" || document.status === "imported" || isFiling) return;
+    const next = { ...document, inbox };
+    if (inbox === "Patient's File") {
+      next.assignedUser = "";
+      next.doctorId = undefined;
+      next.userVerified = false;
+    }
+    updateDocument(document.id, { ...next, status: getDocumentStatus(next) });
+  }
+
   function handlePatientSelection(document: DocumentItem, option: PatientOption | null) {
     verificationRequests.current.set(document.id, (verificationRequests.current.get(document.id) ?? 0) + 1);
     const original = originalExtractedPatient(document);
@@ -531,7 +549,7 @@ export function DocumentWorkspace({
     }
   }
 
-  async function handleUpload(event: ChangeEvent<HTMLInputElement>) {
+  async function handleUploadImpl(event: ChangeEvent<HTMLInputElement>) {
     const allFiles = Array.from(event.target.files ?? []);
     event.target.value = "";
     if (allFiles.length === 0 || !documentsLoaded || isImporting || filingInProgress.current) return;
@@ -639,6 +657,29 @@ export function DocumentWorkspace({
     );
   }
 
+  async function exclusiveOperation(action: () => Promise<void>, failIfBusy = false) {
+    if (operationLock.current) {
+      if (failIfBusy) throw new Error("Wait for the current folder operation to finish, then retry.");
+      return;
+    }
+    operationLock.current = true;
+    try { await action(); } finally { operationLock.current = false; }
+  }
+  async function handleUpload(event: ChangeEvent<HTMLInputElement>) {
+    if (operationLock.current) {
+      event.target.value = "";
+      showNotice("Wait for the current folder operation to finish, then select the files again.");
+      return;
+    }
+    await exclusiveOperation(() => handleUploadImpl(event));
+  }
+  async function handleDeleteSelected() { await exclusiveOperation(handleDeleteSelectedImpl); }
+  async function handleRestoreSelected() { await exclusiveOperation(handleRestoreSelectedImpl); }
+  async function handleImportDocument() { await exclusiveOperation(handleImportDocumentImpl); }
+  async function handleConfirmBulkImport() { await exclusiveOperation(handleConfirmBulkImportImpl); }
+  async function handleReprocessDocument() { await exclusiveOperation(handleReprocessDocumentImpl); }
+  async function savePdfOperation(files: File[]) { await exclusiveOperation(() => savePdfOperationImpl(files), true); }
+
   function getNewFolderFiles(files: File[]): File[] {
     const seen = new Set(documents.filter((doc) => doc.status !== "deleted").map((doc) => doc.name.toLowerCase().trim()));
     return files.filter((file) => {
@@ -721,6 +762,7 @@ export function DocumentWorkspace({
     try {
       await clearImportFolder(userId);
       setFolderHandle(null);
+      setFolderFiles([]);
       setFolderName("");
       showNotice("Saved import folder cleared");
     } catch (error) {
@@ -755,7 +797,7 @@ export function DocumentWorkspace({
     })));
   }
 
-  async function handleDeleteSelected() {
+  async function handleDeleteSelectedImpl() {
     if (selectedCount === 0 || isImporting || isRecycling || isFiling) return;
     setIsRecycling(true);
     try {
@@ -771,7 +813,7 @@ export function DocumentWorkspace({
     } finally { setIsRecycling(false); }
   }
 
-  async function handleRestoreSelected() {
+  async function handleRestoreSelectedImpl() {
     if (selectedCount === 0 || isImporting || isRecycling || isFiling) return;
     setIsRecycling(true);
     try {
@@ -792,7 +834,7 @@ export function DocumentWorkspace({
     } finally { setIsRecycling(false); }
   }
 
-  async function handleImportDocument() {
+  async function handleImportDocumentImpl() {
     if (!selectedDocument || !canFileSelected || isReprocessing || filingInProgress.current) return;
     const snapshot = selectedDocument;
     filingInProgress.current = true;
@@ -827,7 +869,7 @@ export function DocumentWorkspace({
     setPdfOperation({ mode, sources });
   }
 
-  async function savePdfOperation(files: File[]) {
+  async function savePdfOperationImpl(files: File[]) {
     if (!pdfOperation) return;
     const names = new Set(documents.filter((doc) => doc.status !== "deleted").map((doc) => doc.name.toLowerCase().trim()));
     for (const file of files) {
@@ -919,7 +961,7 @@ export function DocumentWorkspace({
     }
   }
 
-  async function handleConfirmBulkImport() {
+  async function handleConfirmBulkImportImpl() {
     if (isImporting || !documentsLoaded || filingInProgress.current) return;
     if (folderName && !folderHandle && folderFiles.length === 0) {
       setImportDialogOpen(false);
@@ -1246,7 +1288,7 @@ export function DocumentWorkspace({
     showNotice(`All fields reset for "${selectedDocument.name}"`);
   }
 
-  async function handleReprocessDocument() {
+  async function handleReprocessDocumentImpl() {
     if (!selectedDocument || selectedDocument.status === "imported" || isReprocessing) return;
     if (!selectedDocument.previewUrl) {
       showNotice("The document preview file is unavailable for reprocessing");
@@ -1295,6 +1337,8 @@ export function DocumentWorkspace({
     <Box
       sx={{
         minHeight: "100dvh",
+        height: { xs: "auto", lg: "100dvh" },
+        overflow: { xs: "visible", lg: "hidden" },
         display: "flex",
         flexDirection: "column",
         bgcolor: "#f6f8fa",
@@ -1306,6 +1350,7 @@ export function DocumentWorkspace({
         color="transparent"
         elevation={0}
         sx={{
+          flexShrink: 0,
           borderBottom: "1px solid #dfe7ec",
           bgcolor: "#f5fafc",
           color: "text.primary",
@@ -1345,8 +1390,9 @@ export function DocumentWorkspace({
       <Box
         component="main"
         sx={{
-          flex: 1,
+          flex: { xs: "none", lg: "1 1 0%" },
           minHeight: 0,
+          overflow: { xs: "visible", lg: "hidden" },
           display: "grid",
           gridTemplateColumns: {
             xs: "minmax(0, 1fr)",
@@ -1362,9 +1408,9 @@ export function DocumentWorkspace({
             xs: selectedDocument
               ? "minmax(520px, 68vh) minmax(480px, 70vh) minmax(640px, 1fr)"
               : "minmax(520px, 68vh) minmax(480px, 70vh)",
-            lg: "1fr",
+            lg: "minmax(0, 1fr)",
           },
-          height: { xs: "auto", lg: "calc(100dvh - 56px)" },
+          height: "auto",
         }}
       >
         <Box
@@ -1388,6 +1434,8 @@ export function DocumentWorkspace({
               py: 1.25,
               borderBottom: "1px solid #edf0f2",
               alignItems: "center",
+              flexWrap: "wrap",
+              rowGap: 1,
             }}
           >
             <Button
@@ -1613,7 +1661,7 @@ export function DocumentWorkspace({
                   <MenuItem value="Correspondence">Correspondence</MenuItem>
                   <MenuItem value="Investigations">Investigations</MenuItem>
                 </TextField>
-                <Alert severity="info" sx={{ mt: 1 }}>The storage selection applies to new files in this batch. Inbox Type always follows category. Changing category later resets Store in to its category default.</Alert>
+                <Alert severity="info" sx={{ mt: 1 }}>The storage selection applies to new files in this batch. Inbox Type starts from category and can be adjusted in Queue. Changing category later restores its routing defaults.</Alert>
                 {bulkImportCount === null && (
                   <Alert severity="warning" sx={{ mt: 1 }}>
                     {needsFolderAccess
@@ -1682,7 +1730,7 @@ export function DocumentWorkspace({
                     />
                   </TableCell>
                   <TableCell sx={{ width: { xs: 28, sm: 36 }, px: { xs: 0.5, sm: 0.75 }, fontWeight: 700 }}>#</TableCell>
-                  <TableCell sx={{ width: { xs: 110, sm: 160 }, fontWeight: 700 }}>FILE</TableCell>
+                  <TableCell sx={{ width: 104, px: 0.5, fontWeight: 700 }}>FILE</TableCell>
                   <TableCell sx={{ width: { xs: 68, sm: 90 }, px: { xs: 0.25, sm: 0.5 }, fontWeight: 700 }}>STATUS</TableCell>
                   <TableCell sx={{ width: { xs: 68, sm: 90 }, px: { xs: 0.25, sm: 0.5 }, fontWeight: 700 }}>INBOX</TableCell>
                   <TableCell sx={{ width: { xs: 80, sm: 110 }, px: { xs: 0.25, sm: 0.5 }, fontWeight: 700 }}>PATIENT</TableCell>
@@ -1707,8 +1755,12 @@ export function DocumentWorkspace({
                       />
                     </TableCell>
                     <TableCell sx={{ px: { xs: 0.5, sm: 0.5 } }}>{index + 1}</TableCell>
-                    <TableCell sx={{ overflow: "hidden", textOverflow: "ellipsis" }} title={document.name}>
-                      <Typography variant="body2" noWrap>{document.name}</Typography>
+                    <TableCell sx={{ px: 0.5 }}>
+                      <Tooltip title={document.name} describeChild>
+                        <Typography variant="body2" tabIndex={0} sx={{ whiteSpace: "nowrap", maxWidth: "100%", overflow: "hidden", textOverflow: "ellipsis" }}>
+                          {Array.from(document.name).length > 12 ? `${Array.from(document.name).slice(0, 12).join("")}...` : document.name}
+                        </Typography>
+                      </Tooltip>
                       {activeTab === "recycle" && document.deletedAt && <Typography variant="caption" color="text.secondary">{new Date(document.deletedAt).toLocaleDateString()}</Typography>}
                     </TableCell>
                     <TableCell>
@@ -1717,7 +1769,7 @@ export function DocumentWorkspace({
                     <TableCell sx={{ px: { xs: 0.25, sm: 0.5 }, overflow: "hidden", textOverflow: "ellipsis" }}>
                       {document.inbox}
                     </TableCell>
-                    <TableCell sx={{ px: { xs: 0.25, sm: 0.5 }, overflow: "hidden" }}>
+                    <TableCell sx={{ px: { xs: 0.25, sm: 0.5 } }}>
                       <Stack direction="row" spacing={0.5} sx={{ alignItems: "center", minWidth: 0 }}>
                         {document.patientVerified && (
                           <CheckIcon
@@ -1727,10 +1779,10 @@ export function DocumentWorkspace({
                         )}
                         <Typography
                           variant="body2"
-                          noWrap
                           sx={{
-                            overflow: "hidden",
-                            textOverflow: "ellipsis",
+                            minWidth: 0,
+                            whiteSpace: "normal",
+                            overflowWrap: "anywhere",
                             color: document.patientVerified ? "primary.main" : "error.dark",
                             fontWeight: document.patientVerified ? 500 : 400,
                           }}
@@ -1740,7 +1792,7 @@ export function DocumentWorkspace({
                         </Typography>
                       </Stack>
                     </TableCell>
-                    <TableCell sx={{ px: { xs: 0.25, sm: 0.5 }, overflow: "hidden" }}>
+                    <TableCell sx={{ px: { xs: 0.25, sm: 0.5 } }}>
                       {document.inbox === "Patient's File" ? (
                         <Typography variant="body2" color="text.secondary" noWrap>
                           —
@@ -1755,10 +1807,10 @@ export function DocumentWorkspace({
                           )}
                           <Typography
                             variant="body2"
-                            noWrap
-                            sx={{
-                              overflow: "hidden",
-                              textOverflow: "ellipsis",
+                              sx={{
+                              minWidth: 0,
+                              whiteSpace: "normal",
+                              overflowWrap: "anywhere",
                               color: document.userVerified
                                 ? "primary.main"
                                 : document.assignedUser
@@ -1786,10 +1838,12 @@ export function DocumentWorkspace({
           sx={{
             minWidth: 0,
             minHeight: 0,
+            height: { xs: "70dvh", lg: "100%" },
+            maxHeight: { xs: "70dvh", lg: "100%" },
             display: "flex",
             alignItems: "center",
             justifyContent: "center",
-            overflow: "auto",
+            overflow: "hidden",
             borderRight: { lg: "1px solid #e0e5e9" },
             borderBottom: { xs: "1px solid #e0e5e9", lg: 0 },
             bgcolor: "#edf1f4",
@@ -2294,9 +2348,15 @@ export function DocumentWorkspace({
                     id="field-wrapper-inbox"
                     onClick={() => setActiveHighlightField("inbox")}
                   >
-                    <TextField label="Inbox Type" value={selectedDocument.inbox} fullWidth
-                      error={Boolean(filingErrors.inbox)} helperText={filingErrors.inbox || "Set automatically by the document category."}
-                      slotProps={{ input: { readOnly: true } }} />
+                    <FormControl error={Boolean(filingErrors.inbox)} fullWidth>
+                      <FormLabel id="inbox-type-label">Inbox Type</FormLabel>
+                      <RadioGroup row aria-labelledby="inbox-type-label" aria-describedby="inbox-type-help" value={selectedDocument.inbox}
+                        onChange={(_, value) => handleInboxChange(selectedDocument, value === "Patient's File" ? "Patient's File" : "Doctor's Inbox")}>
+                        <FormControlLabel value="Doctor's Inbox" control={<Radio size="small" />} label="Doctor's Inbox" disabled={activeTab !== "queue" || isSelectedImported || isFiling} />
+                        <FormControlLabel value="Patient's File" control={<Radio size="small" />} label="Patient's File" disabled={activeTab !== "queue" || isSelectedImported || isFiling} />
+                      </RadioGroup>
+                      <FormHelperText id="inbox-type-help">{filingErrors.inbox || "Set from category; you can change it in Queue before importing."}</FormHelperText>
+                    </FormControl>
                   </Box>
 
                   <Box
@@ -2356,15 +2416,26 @@ export function DocumentWorkspace({
                   {selectedDocument.patientVerified ? (
                     <Stack
                       direction="row"
-                      spacing={1}
-                      sx={{ alignItems: "center", justifyContent: "space-between" }}
+                      sx={{ alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 1 }}
                     >
-                      <Stack direction="row" spacing={0.5} sx={{ alignItems: "center" }}>
-                        <Typography variant="body2" color="text.secondary">
+                        <Typography
+                          variant="body2"
+                          sx={{
+                            display: "inline-flex",
+                            alignItems: "center",
+                            px: 1.25,
+                            py: 0.625,
+                            borderRadius: 2,
+                            background: "linear-gradient(110deg, #eff6ff 0%, #bfdbfe 100%)",
+                            border: "1px solid #93c5fd",
+                            color: "#1e3a8a",
+                            fontWeight: 600,
+                            whiteSpace: "nowrap",
+                          }}
+                        >
                           {selectedDocument.matchedIdentifierCount} identifier
                           {selectedDocument.matchedIdentifierCount === 1 ? "" : "s"} verified
                         </Typography>
-                      </Stack>
                       <Button
                         size="small"
                         variant="outlined"
@@ -2842,9 +2913,11 @@ function StatusChip({ status }: { status: DocumentStatus }) {
       color={color}
       sx={{
         maxWidth: "100%",
+        height: "auto",
+        minHeight: 24,
         fontWeight: 700,
         fontSize: { xs: "0.65rem", sm: "0.8125rem" },
-        "& .MuiChip-label": { px: 0.75, overflow: "hidden", textOverflow: "ellipsis" },
+        "& .MuiChip-label": { px: 0.75, py: 0.25, whiteSpace: "normal", overflowWrap: "anywhere", textAlign: "center" },
       }}
     />
   );
@@ -2909,7 +2982,7 @@ function DocxPreview({ document }: { document: DocumentItem }) {
   }, [document.id, document.previewUrl]);
 
   return (
-    <Box sx={{ position: "relative", width: "100%", height: "100%", minHeight: 480, overflow: "auto", bgcolor: "#edf1f4" }}>
+    <Box sx={{ position: "relative", width: "100%", height: "100%", minHeight: 0, overflow: "auto", overscrollBehavior: "contain", bgcolor: "#edf1f4" }}>
       <Box
         ref={previewRef}
         sx={{ minHeight: "100%" }}

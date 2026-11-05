@@ -62,5 +62,5 @@ it.each(documentCategories)("routes category %s consistently while allowing an e
   const inbox = clinical.has(category) ? "Doctor's Inbox" : "Patient's File";
   expect(getCategoryRouting(category)).toEqual({ inbox, storeIn: clinical.has(category) ? "Investigations" : "Correspondence" });
   expect(validateDocumentFiling({ ...valid, category, inbox, storeIn: "Correspondence" })).toEqual({});
-  expect(validateDocumentFiling({ ...valid, category, inbox: inbox === "Doctor's Inbox" ? "Patient's File" : "Doctor's Inbox" }).inbox).toContain("must use");
+  expect(validateDocumentFiling({ ...valid, category, inbox: inbox === "Doctor's Inbox" ? "Patient's File" : "Doctor's Inbox" }).inbox).toBeUndefined();
 });

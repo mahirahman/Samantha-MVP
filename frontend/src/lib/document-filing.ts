@@ -37,8 +37,6 @@ export function validateDocumentFiling(doc: DocumentItem): FilingErrors {
   if (!["Doctor's Inbox", "Patient's File"].includes(doc.inbox)) errors.inbox = "Select a supported inbox type.";
   if (!["Correspondence", "Investigations"].includes(doc.storeIn)) errors.storeIn = "Select Correspondence or Investigations.";
   if (!documentCategories.some((category) => category === doc.category)) errors.category = "Select a supported category.";
-  const routing = getCategoryRouting(doc.category);
-  if (routing && doc.inbox !== routing.inbox) errors.inbox = `This category must use ${routing.inbox}. Select the category again to correct routing.`;
   if (doc.inbox === "Doctor's Inbox" && (!doc.assignedUser.trim() || !doc.doctorId?.trim() || doc.doctorId.startsWith("fallback-") || !doc.userVerified)) errors.assignedUser = "Select and verify a database GP doctor.";
   if (doc.status === "error" || doc.status === "deleted") errors.status = "Resolve the document error or restore it to Queue before importing.";
   return errors;
