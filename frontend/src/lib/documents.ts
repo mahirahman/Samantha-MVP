@@ -2,7 +2,7 @@ import { getSupabaseClient } from "./supabase";
 import type { DocumentHighlight } from "./document-processing";
 import type { NewPatientInput } from "./patients";
 
-export type DocumentStatus = "check" | "verified" | "error" | "imported";
+export type DocumentStatus = "check" | "verified" | "error" | "imported" | "deleted";
 export type InboxType = "Doctor's Inbox" | "Patient's File";
 export type StoreLocation = "Correspondence" | "Investigations";
 
@@ -10,6 +10,8 @@ export interface DocumentItem {
   id: string;
   name: string;
   status: DocumentStatus;
+  previousStatus?: DocumentStatus;
+  deletedAt?: string;
   inbox: InboxType;
   patient: string;
   patientId?: string;
@@ -42,6 +44,8 @@ interface DocumentRow {
   file_last_modified?: number | null;
   mime_type?: string | null;
   status: string;
+  previous_status?: string | null;
+  deleted_at?: string | null;
   category?: string | null;
   document_category?: string | null;
   subject?: string | null;
@@ -90,6 +94,7 @@ function setCachedDocuments(docs: DocumentItem[], userId?: string): void {
 }
 
 function normalizeStatus(dbStatus: string): DocumentStatus {
+  if (dbStatus === "deleted") return "deleted";
   if (dbStatus === "imported" || dbStatus === "filed") return "imported";
   if (dbStatus === "error" || dbStatus === "failed") return "error";
   if (dbStatus === "verified" || dbStatus === "ready_to_file") return "verified";
@@ -115,6 +120,8 @@ function mapRowToDocumentItem(row: DocumentRow): DocumentItem {
     id: row.id,
     name: row.file_name,
     status: normalizeStatus(row.status),
+    previousStatus: row.previous_status ? normalizeStatus(row.previous_status) : undefined,
+    deletedAt: row.deleted_at || undefined,
     inbox: (row.inbox as InboxType) || "Doctor's Inbox",
     patient: row.patient_name || "",
     patientId: row.patient_id || undefined,
@@ -144,7 +151,7 @@ function mapRowToDocumentItem(row: DocumentRow): DocumentItem {
  * Loads all workspace documents from Supabase.
  * Uses the database as the authority and cache only for preview metadata.
  */
-export async function listWorkspaceDocuments(userId?: string): Promise<DocumentItem[]> {
+export async function listWorkspaceDocuments(userId?: string, includeDeleted = false): Promise<DocumentItem[]> {
   const cached = loadCachedDocuments(userId);
 
   try {
@@ -153,9 +160,9 @@ export async function listWorkspaceDocuments(userId?: string): Promise<DocumentI
     // Supabase limits each response; duplicate checks must include every page.
     for (let offset = 0; ; offset += 1000) {
       let query = client.from("documents").select("*")
-        .neq("status", "deleted")
         .order("created_at", { ascending: false }).order("id")
         .range(offset, offset + 999);
+      if (!includeDeleted) query = query.neq("status", "deleted");
       if (userId) query = query.or(`uploaded_by.eq.${userId},uploaded_by.is.null`);
       const { data, error } = await query;
       if (error) throw new Error(`Could not load workspace: ${error.message}`);
@@ -230,6 +237,7 @@ export async function saveWorkspaceDocument(
   let storagePath: string | null = null;
   if (file) {
     storagePath = await uploadDocumentFileToStorage(file, userId, doc.id);
+    if (!storagePath) throw new Error("Could not store the document file. Please retry.");
   }
 
   try {
@@ -397,6 +405,16 @@ export async function deleteWorkspaceDocumentsFromDb(
   } catch (err) {
     throw err;
   }
+}
+
+/** Restores a recycled record without overwriting its file or extracted metadata. */
+export async function restoreWorkspaceDocumentFromDb(
+  docId: string,
+  status: Exclude<DocumentStatus, "deleted">,
+): Promise<void> {
+  const { error } = await getSupabaseClient().from("documents")
+    .update({ status }).eq("id", docId).eq("status", "deleted").select("id").single();
+  if (error) throw new Error(`Could not restore document: ${error.message}`);
 }
 
 /**

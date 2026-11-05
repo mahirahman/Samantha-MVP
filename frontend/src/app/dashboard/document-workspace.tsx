@@ -18,7 +18,6 @@ import DialogTitle from "@mui/material/DialogTitle";
 import FormControlLabel from "@mui/material/FormControlLabel";
 import IconButton from "@mui/material/IconButton";
 import LinearProgress from "@mui/material/LinearProgress";
-import Menu from "@mui/material/Menu";
 import MenuItem from "@mui/material/MenuItem";
 import Paper from "@mui/material/Paper";
 import Radio from "@mui/material/Radio";
@@ -46,12 +45,14 @@ import CloudUploadOutlinedIcon from "@mui/icons-material/CloudUploadOutlined";
 import DeleteIcon from "@mui/icons-material/DeleteOutlined";
 import DescriptionOutlinedIcon from "@mui/icons-material/DescriptionOutlined";
 import DoneAllIcon from "@mui/icons-material/DoneAll";
-import DownloadOutlinedIcon from "@mui/icons-material/DownloadOutlined";
 import FlagOutlinedIcon from "@mui/icons-material/FlagOutlined";
 import FolderOpenOutlinedIcon from "@mui/icons-material/FolderOpenOutlined";
 import LogoutIcon from "@mui/icons-material/Logout";
-import MoreHorizIcon from "@mui/icons-material/MoreHoriz";
+import ContentCutIcon from "@mui/icons-material/ContentCut";
 import MoveToInboxIcon from "@mui/icons-material/MoveToInbox";
+import RestoreFromTrashIcon from "@mui/icons-material/RestoreFromTrash";
+import MergeIcon from "@mui/icons-material/Merge";
+import { PdfOperationsDialog, type PdfOperation } from "./pdf-operations-dialog";
 import OpenInFullIcon from "@mui/icons-material/OpenInFull";
 import RefreshIcon from "@mui/icons-material/Refresh";
 import RestartAltIcon from "@mui/icons-material/RestartAlt";
@@ -67,7 +68,7 @@ import {
   saveImportFolderName,
   type ImportDirectoryHandle,
 } from "@/lib/import-folder";
-import { listWorkspaceDocuments, saveWorkspaceDocument, deleteWorkspaceDocumentsFromDb, type DocumentItem as StoredDocumentItem } from "@/lib/documents";
+import { listWorkspaceDocuments, saveWorkspaceDocument, deleteWorkspaceDocumentsFromDb, restoreWorkspaceDocumentFromDb, type DocumentItem as StoredDocumentItem } from "@/lib/documents";
 import { processDocumentFile } from "@/lib/document-processing";
 import { InteractiveDocumentViewer } from "./interactive-document-viewer";
 import {
@@ -86,8 +87,8 @@ import {
   type DoctorRecord,
 } from "@/lib/doctors";
 
-type DocumentStatus = "check" | "verified" | "error" | "imported";
-type QueueTab = "queue" | "imported" | "errors";
+type DocumentStatus = StoredDocumentItem["status"];
+type QueueTab = "queue" | "imported" | "errors" | "recycle";
 type ImportDestination = "assigned" | "doctor-inbox" | "patient-file";
 type StoreLocation = "Correspondence" | "Investigations";
 
@@ -157,6 +158,7 @@ const statusInfo: Record<
   verified: { label: "Verified", color: "success" },
   error: { label: "Error", color: "error" },
   imported: { label: "Imported", color: "info" },
+  deleted: { label: "Recycled", color: "info" },
 };
 
 export function isDocumentVerified(document: {
@@ -174,6 +176,7 @@ export function isDocumentVerified(document: {
 }
 
 export function getDocumentStatus(document: DocumentItem): DocumentStatus {
+  if (document.status === "deleted") return "deleted";
   if (document.status === "imported") return "imported";
   if (document.status === "error") return "error";
   if (isDocumentVerified(document)) return "verified";
@@ -222,14 +225,15 @@ export function DocumentWorkspace({
   const [importDestination, setImportDestination] = useState<ImportDestination>("assigned");
   const [bulkImportCount, setBulkImportCount] = useState<number | null>(null);
   const [isCountingFolder, setIsCountingFolder] = useState(false);
-  const [menuAnchor, setMenuAnchor] = useState<HTMLElement | null>(null);
+  const [pdfOperation, setPdfOperation] = useState<PdfOperation | null>(null);
+  const [isRecycling, setIsRecycling] = useState(false);
   const uploadInput = useRef<HTMLInputElement>(null);
   const folderInput = useRef<HTMLInputElement>(null);
   const previewUrls = useRef(new Set<string>());
 
   useEffect(() => {
     let active = true;
-    void listWorkspaceDocuments(userId).then((records) => {
+    void listWorkspaceDocuments(userId, true).then((records) => {
       if (!active) return;
       const loaded = records.map((record) => ({
         ...record,
@@ -356,12 +360,13 @@ export function DocumentWorkspace({
   const errorDocuments = documents.filter(
     (document) => getDocumentStatus(document) === "error",
   );
+  const recycledDocuments = documents.filter((document) => document.status === "deleted");
   const visibleDocuments =
     activeTab === "queue"
       ? queueDocuments
       : activeTab === "imported"
         ? importedDocuments
-        : errorDocuments;
+        : activeTab === "errors" ? errorDocuments : recycledDocuments;
   const selectedDocument = documents.find(
     (document) => document.id === selectedDocumentId,
   );
@@ -539,7 +544,7 @@ export function DocumentWorkspace({
     if (allFiles.length === 0 || !documentsLoaded || isImporting) return;
 
     // Reject any files that already exist in documents (queue, imported, or errors) or duplicates in current batch
-    const existingNames = new Set(documents.map((d) => d.name.toLowerCase().trim()));
+    const existingNames = new Set(documents.filter((d) => d.status !== "deleted").map((d) => d.name.toLowerCase().trim()));
     const seenInBatch = new Set<string>();
     const files: File[] = [];
     const skippedFiles: string[] = [];
@@ -556,7 +561,7 @@ export function DocumentWorkspace({
 
     if (files.length === 0) {
       const existingDoc = documents.find(
-        (d) => d.name.toLowerCase().trim() === allFiles[0].name.toLowerCase().trim(),
+        (d) => d.status !== "deleted" && d.name.toLowerCase().trim() === allFiles[0].name.toLowerCase().trim(),
       );
       const tabName =
         existingDoc?.status === "imported"
@@ -642,7 +647,7 @@ export function DocumentWorkspace({
   }
 
   function getNewFolderFiles(files: File[]): File[] {
-    const seen = new Set(documents.map((doc) => doc.name.toLowerCase().trim()));
+    const seen = new Set(documents.filter((doc) => doc.status !== "deleted").map((doc) => doc.name.toLowerCase().trim()));
     return files.filter((file) => {
       const name = file.name.toLowerCase().trim();
       if (seen.has(name)) return false;
@@ -745,48 +750,102 @@ export function DocumentWorkspace({
     setSelectedIds(new Set(visibleDocuments.map((document) => document.id)));
   }
 
-  function updateSelectedStatus(status: DocumentStatus, message: string) {
-    if (selectedCount === 0) return;
-    setDocuments((current) =>
-      current.map((document) =>
-        selectedIds.has(document.id) ? { ...document, status } : document,
-      ),
-    );
-    setSelectedIds(new Set());
-    setSelectedDocumentId(null);
-    showNotice(message);
+  function commitSavedDocuments(next: DocumentItem[]) {
+    persistedDocuments.current = new Map(next.map((doc) => [doc.id, doc]));
+    setDocuments(next);
   }
 
-  function handleDeleteSelected() {
-    if (selectedCount === 0) return;
-    const removed = documents.filter((document) => selectedIds.has(document.id));
-    removed.forEach((document) => {
-      if (document.previewUrl) {
-        URL.revokeObjectURL(document.previewUrl);
-        previewUrls.current.delete(document.previewUrl);
+  async function reloadSavedDocuments() {
+    const records = await listWorkspaceDocuments(userId, true);
+    commitSavedDocuments(records.map((doc) => ({
+      ...doc, demographics: doc.demographics ?? emptyNewPatientInput(), fileLastModified: doc.fileLastModified ?? 0,
+    })));
+  }
+
+  async function handleDeleteSelected() {
+    if (selectedCount === 0 || isImporting || isRecycling) return;
+    setIsRecycling(true);
+    try {
+      await persistenceQueue.current;
+      await deleteWorkspaceDocumentsFromDb([...selectedIds], userId);
+      commitSavedDocuments(documents.map((doc) => selectedIds.has(doc.id)
+        ? { ...doc, previousStatus: doc.status, status: "deleted", deletedAt: new Date().toISOString() } : doc));
+      setSelectedIds(new Set());
+      setSelectedDocumentId(null);
+      showNotice("Selected documents moved to the recycle bin");
+    } catch (error) {
+      showNotice(error instanceof Error ? error.message : "Could not recycle documents");
+    } finally { setIsRecycling(false); }
+  }
+
+  async function handleRestoreSelected() {
+    if (selectedCount === 0 || isImporting || isRecycling) return;
+    setIsRecycling(true);
+    try {
+      await persistenceQueue.current;
+      const restored: DocumentItem[] = [];
+      for (const doc of recycledDocuments.filter((item) => selectedIds.has(item.id))) {
+        const status = doc.previousStatus && doc.previousStatus !== "deleted" ? doc.previousStatus : "check";
+        await restoreWorkspaceDocumentFromDb(doc.id, status);
+        restored.push({ ...doc, status, deletedAt: undefined });
       }
-    });
-    setDocuments((current) =>
-      current.filter((document) => !selectedIds.has(document.id)),
-    );
-    setSelectedIds(new Set());
-    setSelectedDocumentId(null);
-    showNotice(`${removed.length} file${removed.length === 1 ? "" : "s"} removed`);
+      commitSavedDocuments(documents.map((doc) => restored.find((item) => item.id === doc.id) ?? doc));
+      setSelectedIds(new Set());
+      setSelectedDocumentId(null);
+      showNotice("Documents restored to their previous tabs");
+    } catch (error) {
+      try { await reloadSavedDocuments(); } catch { /* Keep current documents if the database is unavailable. */ }
+      showNotice(error instanceof Error ? error.message : "Could not restore documents");
+    } finally { setIsRecycling(false); }
   }
 
-  function handleDownloadSelected() {
-    const selected = documents.filter((document) => selectedIds.has(document.id));
-    if (selected.length === 0) return;
-    const blob = new Blob([JSON.stringify(selected, null, 2)], {
-      type: "application/json",
-    });
-    const downloadUrl = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = downloadUrl;
-    link.download = "selected-documents.json";
-    link.click();
-    URL.revokeObjectURL(downloadUrl);
-    showNotice("Document list downloaded");
+  function openPdfOperation(mode: "split" | "merge") {
+    const sources = mode === "split" && selectedIds.size === 0 && selectedDocument
+      ? [selectedDocument] : documents.filter((doc) => selectedIds.has(doc.id));
+    if (sources.some((doc) => !["check", "verified"].includes(doc.status) || !(doc.mimeType === "application/pdf" || doc.name.toLowerCase().endsWith(".pdf")))) {
+      showNotice("Select PDFs from the Queue to split or merge.");
+      return;
+    }
+    if ((mode === "split" && sources.length !== 1) || (mode === "merge" && sources.length < 2)) return;
+    setPdfOperation({ mode, sources });
+  }
+
+  async function savePdfOperation(files: File[]) {
+    if (!pdfOperation) return;
+    const names = new Set(documents.filter((doc) => doc.status !== "deleted").map((doc) => doc.name.toLowerCase().trim()));
+    for (const file of files) {
+      const key = file.name.toLowerCase().trim();
+      if (names.has(key)) throw new Error(`"${file.name}" already exists. Choose a different filename.`);
+      names.add(key);
+    }
+    setIsImporting(true);
+    const saved: DocumentItem[] = [];
+    try {
+      await persistenceQueue.current;
+      for (const file of files) {
+        const [document] = createDocumentItems([file]);
+        // Persist each new PDF before processing; preserve originals on any save failure.
+        await saveWorkspaceDocument({ ...document, status: "error", processingError: "Processing was interrupted. Reprocess to retry." }, userId, file);
+        saved.push(document);
+        let processed: DocumentItem;
+        try { processed = await mapExtraction(document, await processDocumentFile(file)); }
+        catch (error) { processed = { ...document, status: "error", processingError: error instanceof Error ? error.message : "Document processing failed" }; }
+        await saveWorkspaceDocument(processed, userId);
+        saved[saved.length - 1] = processed;
+      }
+      const originalIds = new Set(pdfOperation.sources.map((doc) => doc.id));
+      await deleteWorkspaceDocumentsFromDb([...originalIds], userId);
+      commitSavedDocuments([...saved, ...documents.map((doc) => originalIds.has(doc.id)
+        ? { ...doc, status: "deleted" as const, previousStatus: doc.status, deletedAt: new Date().toISOString() } : doc)]);
+      setSelectedIds(new Set());
+      setSelectedDocumentId(saved[0]?.id ?? null);
+      setActiveTab(saved.some((doc) => doc.status === "error") ? "errors" : "queue");
+      showNotice(`${saved.length} new document${saved.length === 1 ? "" : "s"} created; originals moved to the recycle bin`);
+    } catch (error) {
+      // Keep successfully written output records visible, without removing originals.
+      try { await reloadSavedDocuments(); } catch { /* Keep current documents if the database is unavailable. */ }
+      throw error;
+    } finally { setIsImporting(false); }
   }
 
   async function handleOpenBulkImport() {
@@ -874,7 +933,7 @@ export function DocumentWorkspace({
       }
 
       // Filter out files that already exist in documents (queue, imported, or errors)
-      const existingNames = new Set(documents.map((d) => d.name.toLowerCase().trim()));
+      const existingNames = new Set(documents.filter((d) => d.status !== "deleted").map((d) => d.name.toLowerCase().trim()));
       const seenNames = new Set<string>();
       const newFilesToProcess: File[] = [];
       let duplicateCount = 0;
@@ -1141,17 +1200,6 @@ export function DocumentWorkspace({
         };
       }),
     );
-  }
-
-  function handleClearQueue() {
-    const queueIds = new Set(queueDocuments.map((document) => document.id));
-    setDocuments((current) =>
-      current.filter((document) => !queueIds.has(document.id)),
-    );
-    setSelectedIds(new Set());
-    setSelectedDocumentId(null);
-    setMenuAnchor(null);
-    showNotice("Import queue cleared");
   }
 
   function refreshQueue(scope: "all" | "selected") {
@@ -1428,6 +1476,7 @@ export function DocumentWorkspace({
               label={<TabLabel label="Errors" count={errorDocuments.length} />}
               sx={{ minHeight: 44, py: 0 }}
             />
+            <Tab value="recycle" label={<TabLabel label="Recycle bin" count={recycledDocuments.length} />} sx={{ minHeight: 44, py: 0 }} />
           </Tabs>
 
           <Paper
@@ -1439,7 +1488,7 @@ export function DocumentWorkspace({
               sx={{ alignItems: "center", justifyContent: "space-between" }}
             >
               <Typography variant="subtitle2" sx={{ fontWeight: 700, letterSpacing: 0.3 }}>
-                {activeTab === "queue" ? "IMPORT QUEUE" : activeTab.toUpperCase()}
+                {activeTab === "queue" ? "IMPORT QUEUE" : activeTab === "recycle" ? "RECYCLE BIN" : activeTab.toUpperCase()}
               </Typography>
               <Chip
                 size="small"
@@ -1457,10 +1506,10 @@ export function DocumentWorkspace({
                 disabled={selectedCount === 0}
               />
               <QueueActionButton
-                label="Delete from queue"
-                icon={<DeleteIcon fontSize="small" />}
-                onClick={handleDeleteSelected}
-                disabled={selectedCount === 0}
+                label={activeTab === "recycle" ? "Restore selected" : "Move to recycle bin"}
+                icon={activeTab === "recycle" ? <RestoreFromTrashIcon fontSize="small" /> : <DeleteIcon fontSize="small" />}
+                onClick={activeTab === "recycle" ? handleRestoreSelected : handleDeleteSelected}
+                disabled={selectedCount === 0 || isImporting || isRecycling}
               />
               <QueueActionButton
                 label="Select all"
@@ -1474,48 +1523,13 @@ export function DocumentWorkspace({
                 onClick={() => setSelectedIds(new Set())}
                 disabled={selectedCount === 0}
               />
-              <QueueActionButton
-                label="Mark selected verified"
-                icon={<MoveToInboxIcon fontSize="small" />}
-                onClick={() => updateSelectedStatus("verified", "Selected files remain in Queue as verified")}
-                disabled={selectedCount === 0}
-              />
-              <QueueActionButton
-                label="Flag selected as error"
-                icon={<FlagOutlinedIcon fontSize="small" />}
-                onClick={() => updateSelectedStatus("error", "Selected files moved to errors")}
-                disabled={selectedCount === 0}
-              />
-              <QueueActionButton
-                label="Download selected list"
-                icon={<DownloadOutlinedIcon fontSize="small" />}
-                onClick={handleDownloadSelected}
-                disabled={selectedCount === 0}
-              />
-              <Tooltip title="More queue actions">
-                <IconButton
-                  aria-label="More queue actions"
-                  size="small"
-                  onClick={(event) => setMenuAnchor(event.currentTarget)}
-                  sx={{
-                    width: 38,
-                    height: 38,
-                    border: "1px solid",
-                    borderColor: "grey.300",
-                    borderRadius: 1.5,
-                  }}
-                >
-                  <MoreHorizIcon fontSize="small" />
-                </IconButton>
-              </Tooltip>
+              {activeTab === "queue" && <>
+                <QueueActionButton label="Split PDF" icon={<ContentCutIcon fontSize="small" />} onClick={() => openPdfOperation("split")} disabled={isImporting || isRecycling || !(selectedCount === 1 || (selectedCount === 0 && selectedDocument))} />
+                <QueueActionButton label="Merge PDFs" icon={<MergeIcon fontSize="small" />} onClick={() => openPdfOperation("merge")} disabled={isImporting || isRecycling || selectedCount < 2} />
+              </>}
             </Stack>
-            <Menu
-              anchorEl={menuAnchor}
-              open={Boolean(menuAnchor)}
-              onClose={() => setMenuAnchor(null)}
-            >
-              <MenuItem onClick={handleClearQueue}>Clear import queue</MenuItem>
-            </Menu>
+            {activeTab === "recycle" && <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>Documents are retained in this app. Restore returns them to their previous tabs. Files on your computer remain unchanged.</Typography>}
+            {pdfOperation && <PdfOperationsDialog operation={pdfOperation} onClose={() => setPdfOperation(null)} onSave={savePdfOperation} />}
 
             <Dialog
               open={settingsOpen}
@@ -1701,6 +1715,7 @@ export function DocumentWorkspace({
                     />
                   </TableCell>
                   <TableCell sx={{ width: { xs: 28, sm: 36 }, px: { xs: 0.5, sm: 0.75 }, fontWeight: 700 }}>#</TableCell>
+                  <TableCell sx={{ width: { xs: 110, sm: 160 }, fontWeight: 700 }}>FILE</TableCell>
                   <TableCell sx={{ width: { xs: 68, sm: 90 }, px: { xs: 0.25, sm: 0.5 }, fontWeight: 700 }}>STATUS</TableCell>
                   <TableCell sx={{ width: { xs: 68, sm: 90 }, px: { xs: 0.25, sm: 0.5 }, fontWeight: 700 }}>INBOX</TableCell>
                   <TableCell sx={{ width: { xs: 80, sm: 110 }, px: { xs: 0.25, sm: 0.5 }, fontWeight: 700 }}>PATIENT</TableCell>
@@ -1725,6 +1740,10 @@ export function DocumentWorkspace({
                       />
                     </TableCell>
                     <TableCell sx={{ px: { xs: 0.5, sm: 0.5 } }}>{index + 1}</TableCell>
+                    <TableCell sx={{ overflow: "hidden", textOverflow: "ellipsis" }} title={document.name}>
+                      <Typography variant="body2" noWrap>{document.name}</Typography>
+                      {activeTab === "recycle" && document.deletedAt && <Typography variant="caption" color="text.secondary">{new Date(document.deletedAt).toLocaleDateString()}</Typography>}
+                    </TableCell>
                     <TableCell>
                       <StatusChip status={getDocumentStatus(document)} />
                     </TableCell>
@@ -1847,7 +1866,7 @@ export function DocumentWorkspace({
             bgcolor: "#fff",
           }}
         >
-          {selectedDocument ? (
+          {selectedDocument && selectedDocument.status !== "deleted" ? (
             <Paper
               variant="outlined"
               sx={{
