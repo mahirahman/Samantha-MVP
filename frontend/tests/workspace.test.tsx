@@ -111,6 +111,17 @@ it("disables bulk allocation when the folder contains only existing files", asyn
   expect(screen.getByRole("button", { name: "Confirm & Allocate" })).toBeDisabled();
   expect(processDocumentFile).not.toHaveBeenCalled();
 });
+it("opens import settings before bulk import when no folder is configured", async () => {
+  await openWorkspace();
+  fireEvent.click(screen.getByRole("button", { name: "Auto Bulk Import" }));
+  expect(await screen.findByRole("heading", { name: "Import settings" })).toBeInTheDocument();
+  expect(screen.queryByText("Bulk Import Ready")).not.toBeInTheDocument();
+  const file = new File(["pdf"], "New.pdf");
+  Object.defineProperty(file, "webkitRelativePath", { value: "Inbox/New.pdf" });
+  fireEvent.change(screen.getByLabelText("Choose import folder"), { target: { files: [file] } });
+  expect(await screen.findByText("1 new document selected")).toBeInTheDocument();
+  await waitFor(() => expect(screen.queryByRole("heading", { name: "Import settings" })).not.toBeInTheDocument());
+});
 it("requires verification before filing and persists a verified document as imported", async () => {
   vi.mocked(documents.listWorkspaceDocuments).mockResolvedValue([{ ...doc, patientVerified: true, patientId: "patient", userVerified: true, doctorId: "doctor", assignedUser: "Dr Test", reportDate: "2026-11-05", subject: "Report", contact: "Clinic", category: "Letter" }]);
   await openWorkspace();

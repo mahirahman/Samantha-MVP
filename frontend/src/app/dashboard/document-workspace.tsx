@@ -190,6 +190,7 @@ export function DocumentWorkspace({
   const [expanded, setExpanded] = useState(false);
   const [notice, setNotice] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const bulkImportAfterSettings = useRef(false);
   const [importDialogOpen, setImportDialogOpen] = useState(false);
   const [reportErrorDialogOpen, setReportErrorDialogOpen] = useState(false);
   const [reportErrorMessage, setReportErrorMessage] = useState("");
@@ -706,6 +707,11 @@ export function DocumentWorkspace({
       setFolderHandle(handle);
       setFolderName(handle.name);
       setSettingsOpen(false);
+      if (bulkImportAfterSettings.current) {
+        bulkImportAfterSettings.current = false;
+        setBulkImportCount(null);
+        setImportDialogOpen(true);
+      }
       showNotice(`${handle.name} saved to your account`);
       setIsCountingFolder(true);
       try {
@@ -746,6 +752,10 @@ export function DocumentWorkspace({
       setFolderName(selectedFolder);
       setBulkImportCount(newFiles.length);
       setSettingsOpen(false);
+      if (bulkImportAfterSettings.current) {
+        bulkImportAfterSettings.current = false;
+        setImportDialogOpen(true);
+      }
       showNotice(
         skippedCount > 0
           ? `${selectedFolder} saved. ${newFiles.length} new files ready (${skippedCount} existing files skipped).`
@@ -908,6 +918,11 @@ export function DocumentWorkspace({
   }
 
   async function handleOpenBulkImport() {
+    if (!folderName && !folderHandle && folderFiles.length === 0) {
+      bulkImportAfterSettings.current = true;
+      setSettingsOpen(true);
+      return;
+    }
     setImportDialogOpen(true);
     const newFolderFiles = getNewFolderFiles(folderFiles);
     setBulkImportCount(
@@ -1573,7 +1588,7 @@ export function DocumentWorkspace({
 
             <Dialog
               open={settingsOpen}
-              onClose={() => setSettingsOpen(false)}
+              onClose={() => { bulkImportAfterSettings.current = false; setSettingsOpen(false); }}
               fullWidth
               maxWidth="sm"
             >
@@ -1614,7 +1629,7 @@ export function DocumentWorkspace({
                     Clear folder
                   </Button>
                 )}
-                <Button onClick={() => setSettingsOpen(false)}>Done</Button>
+                <Button onClick={() => { bulkImportAfterSettings.current = false; setSettingsOpen(false); }}>Done</Button>
               </DialogActions>
             </Dialog>
 
